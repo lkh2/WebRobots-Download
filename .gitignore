@@ -1,1 +1,4 @@
 decompressed.json
+*.parquet
+*.part
+*.gz
