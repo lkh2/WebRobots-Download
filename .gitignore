@@ -1,4 +1,4 @@
-decompressed.json
+*.json
 *.parquet
 *.part
 *.gz

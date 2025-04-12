@@ -9,9 +9,9 @@ import json
 import polars as pl 
 
 LOCAL = True
-LOCAL_FILE = "C:/Users/leeka/Downloads/Kickstarter_2025-03-12T07_34_02_656Z.json.gz"
+LOCAL_FILE = "C:/Users/leeka/Downloads/Kickstarter/Kickstarter_2025-03-12T07_34_02_656Z.json.gz"
 CHUNK_SIZE = 90 * 1024 * 1024  # 90MB chunks
-HALVED = True  # Set to True to process only half of the entries
+HALVED = False  # Set to True to process only half of the entries
 
 def get_kickstarter_download_link():
     """
@@ -187,6 +187,163 @@ def safe_column_access(df, possible_names):
             return col
     print(f"Warning: Could not find any column matching: {possible_names}. Returning None.")
     return None
+
+def save_filter_metadata(df_final: pl.DataFrame, output_json_path: str):
+    """
+    Calculates filter options (unique values, maps) and min/max ranges
+    from the final DataFrame and saves them to a JSON file.
+
+    Args:
+        df_final (pl.DataFrame): The final, processed DataFrame.
+        output_json_path (str): Path to save the JSON metadata file.
+    """
+    print(f"Calculating filter metadata for {output_json_path}...")
+    metadata = {
+        'categories': ['All Categories'],
+        'countries': ['All Countries'],
+        'states': ['All States'],
+        'subcategories': ['All Subcategories'], # For the 'All Categories' selection
+        'category_subcategory_map': {'All Categories': ['All Subcategories']},
+        'min_max_values': {
+            'pledged': {'min': 0, 'max': 1000},
+            'goal': {'min': 0, 'max': 10000},
+            'raised': {'min': 0, 'max': 500}
+        },
+        'date_ranges': [ # Keep date ranges static for now
+             'All Time', 'Last Month', 'Last 6 Months', 'Last Year',
+             'Last 5 Years', 'Last 10 Years'
+        ]
+    }
+
+    try:
+        # Ensure df_final is not empty before proceeding
+        if df_final.is_empty():
+             print("Warning: Input DataFrame for metadata calculation is empty. Saving default metadata.")
+             # Save default metadata and return
+             with open(output_json_path, 'w', encoding='utf-8') as f:
+                  json.dump(metadata, f, ensure_ascii=False, indent=4)
+             print(f"Default filter metadata saved to {output_json_path}")
+             return # Stop processing if df is empty
+
+
+        schema = df_final.schema
+
+        # --- Categories and Subcategories ---
+        all_subcategories_set = set()
+        if 'Category' in schema:
+            # No .collect() needed here
+            categories_unique_series = df_final.select(pl.col('Category')).unique().get_column('Category')
+            valid_categories = sorted(categories_unique_series.filter(categories_unique_series.is_not_null() & (categories_unique_series != "N/A")).to_list())
+            metadata['categories'] += valid_categories
+            for cat in valid_categories:
+                metadata['category_subcategory_map'][cat] = [] # Initialize empty list
+
+            if 'Subcategory' in schema:
+                # No .collect() needed here
+                cat_subcat_pairs = df_final.select(['Category', 'Subcategory']).unique().drop_nulls()
+                for row in cat_subcat_pairs.iter_rows(named=True):
+                    category = row['Category']
+                    subcategory = row['Subcategory']
+                    if category and subcategory and category != "N/A" and subcategory != "N/A":
+                        if category in metadata['category_subcategory_map']:
+                             metadata['category_subcategory_map'][category].append(subcategory)
+                        all_subcategories_set.add(subcategory)
+            # Sort subcategories within each category
+            for cat in metadata['category_subcategory_map']:
+                 subcats = metadata['category_subcategory_map'][cat]
+                 prefix = []
+                 rest = []
+                 if 'All Subcategories' in subcats: # Should not happen here, but safety check
+                     prefix = ['All Subcategories']
+                     rest = sorted([s for s in subcats if s != 'All Subcategories'])
+                 else:
+                      rest = sorted(subcats)
+                 metadata['category_subcategory_map'][cat] = prefix + rest # Ensure prefix is added if needed later
+
+        # Get all unique subcategories for the 'All Categories' dropdown
+        if 'Subcategory' in schema:
+             if not all_subcategories_set: # If map wasn't built (e.g., no Category col)
+                 # No .collect() needed here
+                 subcategories_unique_series = df_final.select(pl.col('Subcategory')).unique().get_column('Subcategory')
+                 all_subcategories_set.update(subcategories_unique_series.filter(subcategories_unique_series.is_not_null() & (subcategories_unique_series != "N/A")).to_list())
+
+             metadata['subcategories'] += sorted(list(all_subcategories_set))
+             metadata['category_subcategory_map']['All Categories'] += sorted(list(all_subcategories_set))
+
+
+        # --- Countries ---
+        if 'Country' in schema:
+            # No .collect() needed here
+            countries_unique_series = df_final.select(pl.col('Country')).unique().get_column('Country')
+            metadata['countries'] += sorted(countries_unique_series.filter(countries_unique_series.is_not_null() & (countries_unique_series != "N/A")).to_list())
+
+        # --- States ---
+        # Extract plain state names if they are in HTML format
+        if 'State' in schema and schema['State'] == pl.Utf8:
+            # Check if the state column contains the HTML wrapper
+            # Get the first state safely
+            state_series = df_final.select('State').head(1).get_column('State')
+            sample_state_result = None
+            if len(state_series) > 0:
+                 sample_state_result = state_series[0] # Access item using index
+
+            if sample_state_result and isinstance(sample_state_result, str) and sample_state_result.startswith('<div class="state_cell state-'):
+                 # Extract the state name between > and <
+                 # No .collect() needed here
+                 states_unique_series = df_final.select(
+                     pl.col('State').str.extract(r'>([a-zA-Z]+)<', 1).alias("extracted_state")
+                 ).unique().get_column('extracted_state')
+                 plain_states = states_unique_series.filter(states_unique_series.is_not_null() & (states_unique_series != "")).to_list()
+                 # Capitalize for display in the filter dropdown
+                 metadata['states'] += sorted([s.capitalize() for s in plain_states if s.lower() != 'unknown'])
+            else:
+                 # Assume plain state names if no HTML detected
+                 # No .collect() needed here
+                 states_unique_series = df_final.select(pl.col('State')).unique().get_column('State')
+                 plain_states = states_unique_series.filter(states_unique_series.is_not_null() & (states_unique_series != "N/A")).to_list()
+                 metadata['states'] += sorted([s.capitalize() for s in plain_states]) # Capitalize for consistency
+
+
+        # --- Min/Max Values ---
+        required_minmax_cols = ['Raw Pledged', 'Raw Goal', 'Raw Raised']
+        if all(col in schema for col in required_minmax_cols):
+            try:
+                # Aggregations like min/max on an eager DataFrame return a new DataFrame, no .collect()
+                min_max_df = df_final.select([
+                    pl.min('Raw Pledged').alias('min_pledged'),
+                    pl.max('Raw Pledged').alias('max_pledged'),
+                    pl.min('Raw Goal').alias('min_goal'),
+                    pl.max('Raw Goal').alias('max_goal'),
+                    pl.min('Raw Raised').alias('min_raised'),
+                    pl.max('Raw Raised').alias('max_raised') # Use Raw Raised directly
+                ])
+
+                # Access values using .item() or indexing [0]
+                metadata['min_max_values']['pledged']['min'] = int(min_max_df.item(0, 'min_pledged')) if min_max_df.item(0, 'min_pledged') is not None else 0
+                metadata['min_max_values']['pledged']['max'] = int(min_max_df.item(0, 'max_pledged')) if min_max_df.item(0, 'max_pledged') is not None else 1000
+                metadata['min_max_values']['goal']['min'] = int(min_max_df.item(0, 'min_goal')) if min_max_df.item(0, 'min_goal') is not None else 0
+                metadata['min_max_values']['goal']['max'] = int(min_max_df.item(0, 'max_goal')) if min_max_df.item(0, 'max_goal') is not None else 10000
+                metadata['min_max_values']['raised']['min'] = int(min_max_df.item(0, 'min_raised')) if min_max_df.item(0, 'min_raised') is not None else 0
+                # Use calculated max_raised, ensure it's an int
+                max_raised_calc_val = min_max_df.item(0, 'max_raised')
+                metadata['min_max_values']['raised']['max'] = int(max_raised_calc_val) if max_raised_calc_val is not None else 500
+
+                print("Min/max ranges calculated:", metadata['min_max_values'])
+            except Exception as e:
+                print(f"Warning: Error calculating min/max filter ranges: {e}. Using defaults.")
+        else:
+            print("Warning: Missing columns required for min/max filter ranges. Using defaults.")
+
+
+        # --- Save to JSON ---
+        with open(output_json_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=4)
+        print(f"Filter metadata saved successfully to {output_json_path}")
+
+    except Exception as e:
+        import traceback
+        print(f"Error calculating or saving filter metadata: {e}")
+        print(traceback.format_exc())
 
 def json_to_parquet(json_file, parquet_file, halved=False):
     """
@@ -663,6 +820,11 @@ def json_to_parquet(json_file, parquet_file, halved=False):
 
         print("Final columns saved:", ", ".join(list(df_final.columns)))
         print("Sample data head:\n", df_final.head(3))
+
+        # --- Calculate and save filter metadata ---
+        filter_metadata_file = "filter_metadata.json"
+        save_filter_metadata(df_final, filter_metadata_file)
+        # We return True indicating parquet success, metadata saving is best-effort
         return True
 
     except Exception as e:
@@ -671,13 +833,32 @@ def json_to_parquet(json_file, parquet_file, halved=False):
         print(traceback.format_exc()) # Print full traceback
         return False
 
-def process_kickstarter_data(url=None, output_filename="decompressed.json",
+def extract_base_name(file_path):
+    """
+    Extracts the base name from a file path without any extensions.
+    
+    Args:
+        file_path (str): Path to the file
+        
+    Returns:
+        str: Base name without extensions
+    """
+    # Extract just the filename without directory
+    file_name = os.path.basename(file_path)
+    
+    # Remove all extensions (.json.gz -> base_name)
+    base_name = file_name.split('.')[0]
+    
+    return base_name
+
+def process_kickstarter_data(url=None, output_filename=None,
                              download=True, split=True, decompress=True,
                              keep_chunks=True, chunk_size=CHUNK_SIZE,
                              convert_to_parquet=True,
                              halved=False):
     """
     Process Kickstarter data through download, splitting, decompression, and conversion to Parquet.
+    Also generates a metadata file for frontend filters.
 
     Args:
         url (str): URL or local path of the file
@@ -691,13 +872,13 @@ def process_kickstarter_data(url=None, output_filename="decompressed.json",
         halved (bool): If True, only process half of the entries
 
     Returns:
-        dict: Dictionary with paths to the processed files (chunks, decompressed JSON, Parquet)
+        dict: Dictionary with paths to the processed files (chunks, decompressed JSON, Parquet, filter metadata)
     """
     result = {
         "chunks": [],
         "decompressed": None,
         "parquet": None,
-        # Removed parquet_gz and parquet_gz_chunks
+        "filter_metadata": None # Added key for metadata file
     }
 
     # Determine source URL
@@ -709,6 +890,20 @@ def process_kickstarter_data(url=None, output_filename="decompressed.json",
             if not url:
                 print("Failed to get download link")
                 return result
+    
+    # Extract base name from URL/file for consistent naming
+    base_name = extract_base_name(url)
+    
+    # Set output filenames with proper extensions
+    if output_filename is None:
+        output_filename = f"{base_name}.json"
+    
+    # Make sure output_filename has .json extension
+    if not output_filename.lower().endswith('.json'):
+        output_filename = f"{os.path.splitext(output_filename)[0]}.json"
+    
+    # Define parquet filename based on the same base name
+    parquet_file = f"{base_name}.parquet"
     
     # STEP 1: Download
     file_bytes = None
@@ -757,34 +952,30 @@ def process_kickstarter_data(url=None, output_filename="decompressed.json",
         return result  # Stop if decompression failed
     
     # STEP 4: Convert to Parquet
-    # Change the output filename to data.parquet
-    parquet_file = "data.parquet"
+    filter_metadata_file = "filter_metadata.json" # Keep this name as specified
     if convert_to_parquet and result["decompressed"]:
         conversion_success = json_to_parquet(output_filename, parquet_file, halved)
         if conversion_success:
             result["parquet"] = parquet_file
-            # Optionally remove the large JSON file after successful conversion
-            # if os.path.exists(output_filename):
-            #     print(f"Removing intermediate JSON file: {output_filename}")
-            #     os.remove(output_filename)
-            #     result["decompressed"] = None # Update result dict if removed
+            # Check if metadata file was created
+            if os.path.exists(filter_metadata_file):
+                 result["filter_metadata"] = filter_metadata_file
+            else:
+                 print(f"Warning: Parquet conversion succeeded, but filter metadata file '{filter_metadata_file}' was not found.")
         else:
             # If conversion fails, keep the decompressed JSON if it exists
             if not os.path.exists(output_filename):
                  result["decompressed"] = None
             return result # Stop if conversion failed
 
-    # STEP 5 & 6: Compress Parquet and Split Parquet GZ are removed
-
     return result
 
 if __name__ == "__main__":
     result = process_kickstarter_data(
-        output_filename="decompressed.json", # Keep this for the intermediate JSON
-        keep_chunks=True,                # Keep downloaded gzip chunks
+        output_filename=None,  # Let the function determine the filename based on input
+        keep_chunks=True,      # Keep downloaded gzip chunks
         convert_to_parquet=True,
-        # Removed compress_parquet and split_parquet arguments
-        halved=HALVED                    # Pass the HALVED flag
+        halved=HALVED          # Pass the HALVED flag
     )
 
     print("\nProcessing completed!")
@@ -796,4 +987,7 @@ if __name__ == "__main__":
         print(f"Final Parquet file: {result['parquet']}")
         if HALVED:
             print("Note: Parquet file contains only half of the original entries.")
-    # Removed print statements for parquet_gz and parquet_gz_chunks
+    if result["filter_metadata"]:
+        print(f"Filter metadata file: {result['filter_metadata']}")
+    else:
+        print("Filter metadata file was not generated.")
