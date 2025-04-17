@@ -1,341 +1,178 @@
-import requests
-from bs4 import BeautifulSoup
 import gzip
 import time
 import os
-import shutil
 import pandas as pd
+import numpy as np
 import json
-import polars as pl 
 import re
 import datetime
+from pathlib import Path
+import country_converter as coco
+from pandas.errors import ParserError
 
-LOCAL = True
 LOCAL_FILE = "C:/Users/leeka/Downloads/Kickstarter/Kickstarter_2025-03-12T07_34_02_656Z.json.gz"
-CHUNK_SIZE = 90 * 1024 * 1024  # 90MB chunks
-HALVED = False  # Set to True to process only half of the entries
 
-def get_kickstarter_download_link():
-    """
-    Retrieves the download link from the Kickstarter datasets page
-    """
-    url = "https://webrobots.io/kickstarter-datasets/"
-    
-    try:
-        # Fetch the webpage
-        response = requests.get(url)
-        response.raise_for_status()  # Raise exception for HTTP errors
-        
-        # Parse the HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Find the div with class fusion-text
-        fusion_text_div = soup.find('div', class_='fusion-text')
-        if not fusion_text_div:
-            return None
-        
-        # Find the first ul in this div
-        ul = fusion_text_div.find('ul')
-        if not ul:
-            return None
-        
-        # Find the first li in this ul
-        li = ul.find('li')
-        if not li:
-            return None
-        
-        # Find all 'a' tags in the li and look for one with text containing "name json"
-        for a in li.find_all('a'):
-            if a.text and "json" in a.text.lower():
-                print(f"Found link: {a['href']}")
-                return a.get('href')
-        
-        return None
-    
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return None
+# Directory containing the Kickstarter JSON.gz files
+KICKSTARTER_DATA_DIR = Path("C:/Users/leeka/Downloads/Kickstarter")
+# Output filename for filter metadata
+FILTER_METADATA_FILENAME = "filter_metadata.json"
+# Progress reminder frequency
+PROGRESS_REMINDER_INTERVAL = 50000
 
-def download_file(url):
+def parse_date_from_filename(filepath: Path):
     """
-    Downloads a file from a URL or reads from local path
-    
-    Args:
-        url (str): URL or local path of the file to download
-        
-    Returns:
-        bytes: The downloaded file data
+    Extracts the date (YYYY-MM-DD) from a filename matching the pattern
+    'Kickstarter_YYYY-MM-DDTHH_MM_SS_MSZ...'.
+    Returns a datetime.date object or None if parsing fails.
     """
-    if LOCAL:
-        print("Using local file for testing.")
-        with open(url, "rb") as f:
-            file_bytes = f.read()
-        print(f"Read {len(file_bytes)/(1024*1024):.2f} MB from local file")
-    else:
-        print("Downloading the file...")
+    match = re.search(r'Kickstarter_(\d{4}-\d{2}-\d{2})T', filepath.name)
+    if match:
+        date_str = match.group(1)
         try:
-            response = requests.get(url)
-            response.raise_for_status()  # Raise exception for HTTP errors
-            file_bytes = response.content
-            print(f"Downloaded {len(file_bytes)/(1024*1024):.2f} MB")
-        except Exception as e:
-            print(f"Failed to download the file: {e}")
-            return None
-    
-    return file_bytes
+            return pd.to_datetime(date_str).date()
+        except (ValueError, ParserError):
+            print(f"Warning: Could not parse date '{date_str}' from filename '{filepath.name}'.")
+    return None
 
-def split_into_chunks(file_data, chunk_size, dir_name="temp_chunks"):
+def find_kickstarter_files(directory: Path):
     """
-    Split the file data into chunks of specified size
-    
-    Args:
-        file_data (bytes): The file data to chunk
-        chunk_size (int): Size of each chunk in bytes
-        dir_name (str): Directory to save chunks to
-        
-    Returns:
-        list: List of file paths to the chunk files
+    Finds all Kickstarter*.json.gz files in the directory,
+    parses their dates, and returns them sorted by date descending (latest first).
     """
-    chunk_files = []
-    
-    # Create a directory for chunks if it doesn't exist
-    os.makedirs(dir_name, exist_ok=True)
-    
-    # Split the data into chunks and save each chunk
-    for i in range(0, len(file_data), chunk_size):
-        chunk = file_data[i:i + chunk_size]
-        chunk_file_path = os.path.join(dir_name, f"chunk_{i//chunk_size}.part")
-        with open(chunk_file_path, "wb") as f:
-            f.write(chunk)
-        chunk_files.append(chunk_file_path)
-        print(f"Created chunk {i//chunk_size} with size {len(chunk)/(1024*1024):.2f} MB")
-    
-    return chunk_files
+    files_with_dates = []
+    print(f"Scanning directory: {directory}")
+    for filepath in directory.glob("Kickstarter*.json.gz"):
+        file_date = parse_date_from_filename(filepath)
+        if file_date:
+            files_with_dates.append((filepath, file_date))
+        else:
+            print(f"Skipping file due to missing/invalid date in name: {filepath.name}")
 
-def decompress_gzip(input_file, output_filename):
-    """
-    Decompress a Gzip file to the specified output file
-    
-    Args:
-        input_file (str): Path to the Gzip file
-        output_filename (str): Name of the file to save the decompressed data
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    print(f"Decompressing file {input_file}...")
-    start_time = time.time()
-    
-    try:
-        with gzip.open(input_file, "rb") as gz_file:
-            with open(output_filename, "wb") as out_file:
-                shutil.copyfileobj(gz_file, out_file)
-                
-        elapsed_time = time.time() - start_time
-        print(f"Decompression completed in {elapsed_time:.2f} seconds")
-        print(f"Decompressed data saved to {output_filename}")
-        return True
-        
-    except Exception as e:
-        print(f"Decompression failed: {e}")
-        return False
+    if not files_with_dates:
+        print("No valid Kickstarter*.json.gz files found.")
+        return [], None
 
-def reconstruct_and_decompress(chunk_files, output_filename):
-    """
-    Reconstruct a file from chunks and decompress it
-    
-    Args:
-        chunk_files (list): List of paths to chunk files
-        output_filename (str): Name of the file to save the decompressed data
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    print("Reconstructing from chunks and decompressing...")
-    start_time = time.time()
-    
-    # Create a temp file containing all chunks combined
-    temp_combined = "temp_combined.gz"
-    try:
-        with open(temp_combined, "wb") as combined:
-            for chunk_file in chunk_files:
-                with open(chunk_file, "rb") as f:
-                    combined.write(f.read())
-        
-        # Decompress the combined file
-        success = decompress_gzip(temp_combined, output_filename)
-        
-        # Clean up temp file
-        if os.path.exists(temp_combined):
-            os.remove(temp_combined)
-            
-        if success:
-            elapsed_time = time.time() - start_time
-            print(f"Reconstruction and decompression completed in {elapsed_time:.2f} seconds")
-        
-        return success
-        
-    except Exception as e:
-        print(f"Reconstruction and decompression failed: {e}")
-        if os.path.exists(temp_combined):
-            os.remove(temp_combined)
-        return False
+    files_with_dates.sort(key=lambda item: item[1], reverse=True)
 
-# Define safe column access for Polars
+    print(f"Found {len(files_with_dates)} files. Latest: {files_with_dates[0][0].name} ({files_with_dates[0][1]})")
+    return files_with_dates, files_with_dates[0][1] 
+
 def safe_column_access(df, possible_names):
     """Try multiple possible column names and return the first one that exists"""
     for col in possible_names:
         if col in df.columns:
             return col
-    print(f"Warning: Could not find any column matching: {possible_names}. Returning None.")
     return None
 
-def save_filter_metadata(df_final: pl.DataFrame, output_json_path: str):
+def save_filter_metadata(df_final: pd.DataFrame, output_json_path: str):
     """
     Calculates filter options (unique values, maps) and min/max ranges
-    from the final DataFrame and saves them to a JSON file.
-
-    Args:
-        df_final (pl.DataFrame): The final, processed DataFrame.
-        output_json_path (str): Path to save the JSON metadata file.
+    from the final DataFrame and saves them to a JSON file using Pandas.
     """
     print(f"Calculating filter metadata for {output_json_path}...")
     metadata = {
         'categories': ['All Categories'],
         'countries': ['All Countries'],
         'states': ['All States'],
-        'subcategories': ['All Subcategories'], # For the 'All Categories' selection
+        'subcategories': ['All Subcategories'],
         'category_subcategory_map': {'All Categories': ['All Subcategories']},
         'min_max_values': {
             'pledged': {'min': 0, 'max': 1000},
             'goal': {'min': 0, 'max': 10000},
             'raised': {'min': 0, 'max': 500}
         },
-        'date_ranges': [ # Keep date ranges static for now
+        'date_ranges': [ 
              'All Time', 'Last Month', 'Last 6 Months', 'Last Year',
              'Last 5 Years', 'Last 10 Years'
         ]
     }
 
     try:
-        # Ensure df_final is not empty before proceeding
-        if df_final.is_empty():
+        if df_final.empty: 
              print("Warning: Input DataFrame for metadata calculation is empty. Saving default metadata.")
-             # Save default metadata and return
              with open(output_json_path, 'w', encoding='utf-8') as f:
                   json.dump(metadata, f, ensure_ascii=False, indent=4)
              print(f"Default filter metadata saved to {output_json_path}")
-             return # Stop processing if df is empty
-
-
-        schema = df_final.schema
+             return 
 
         # --- Categories and Subcategories ---
         all_subcategories_set = set()
-        if 'Category' in schema:
-            # No .collect() needed here
-            categories_unique_series = df_final.select(pl.col('Category')).unique().get_column('Category')
-            valid_categories = sorted(categories_unique_series.filter(categories_unique_series.is_not_null() & (categories_unique_series != "N/A")).to_list())
+        if 'Category' in df_final.columns:
+            categories_unique = df_final['Category'].dropna().unique()
+            valid_categories = sorted([cat for cat in categories_unique if cat != "N/A"]) 
             metadata['categories'] += valid_categories
             for cat in valid_categories:
-                metadata['category_subcategory_map'][cat] = [] # Initialize empty list
+                metadata['category_subcategory_map'][cat] = []
 
-            if 'Subcategory' in schema:
-                # No .collect() needed here
-                cat_subcat_pairs = df_final.select(['Category', 'Subcategory']).unique().drop_nulls()
-                for row in cat_subcat_pairs.iter_rows(named=True):
+            if 'Subcategory' in df_final.columns:
+                cat_subcat_pairs = df_final[['Category', 'Subcategory']].dropna().drop_duplicates() 
+                for index, row in cat_subcat_pairs.iterrows():
                     category = row['Category']
                     subcategory = row['Subcategory']
                     if category and subcategory and category != "N/A" and subcategory != "N/A":
                         if category in metadata['category_subcategory_map']:
                              metadata['category_subcategory_map'][category].append(subcategory)
                         all_subcategories_set.add(subcategory)
-            # Sort subcategories within each category
             for cat in metadata['category_subcategory_map']:
                  subcats = metadata['category_subcategory_map'][cat]
                  prefix = []
                  rest = []
-                 if 'All Subcategories' in subcats: # Should not happen here, but safety check
+                 if 'All Subcategories' in subcats: 
                      prefix = ['All Subcategories']
                      rest = sorted([s for s in subcats if s != 'All Subcategories'])
                  else:
                       rest = sorted(subcats)
-                 metadata['category_subcategory_map'][cat] = prefix + rest # Ensure prefix is added if needed later
+                 metadata['category_subcategory_map'][cat] = prefix + rest 
 
-        # Get all unique subcategories for the 'All Categories' dropdown
-        if 'Subcategory' in schema:
-             if not all_subcategories_set: # If map wasn't built (e.g., no Category col)
-                 # No .collect() needed here
-                 subcategories_unique_series = df_final.select(pl.col('Subcategory')).unique().get_column('Subcategory')
-                 all_subcategories_set.update(subcategories_unique_series.filter(subcategories_unique_series.is_not_null() & (subcategories_unique_series != "N/A")).to_list())
+        if 'Subcategory' in df_final.columns:
+             if not all_subcategories_set:
+                 subcategories_unique = df_final['Subcategory'].dropna().unique()
+                 all_subcategories_set.update([sub for sub in subcategories_unique if sub != "N/A"])
 
              metadata['subcategories'] += sorted(list(all_subcategories_set))
              metadata['category_subcategory_map']['All Categories'] += sorted(list(all_subcategories_set))
 
-
         # --- Countries ---
-        if 'Country' in schema:
-            # No .collect() needed here
-            countries_unique_series = df_final.select(pl.col('Country')).unique().get_column('Country')
-            metadata['countries'] += sorted(countries_unique_series.filter(countries_unique_series.is_not_null() & (countries_unique_series != "N/A")).to_list())
+        if 'Country' in df_final.columns:
+            countries_unique = df_final['Country'].dropna().unique()
+            metadata['countries'] += sorted([c for c in countries_unique if c != "N/A"])
 
         # --- States ---
-        # Extract plain state names if they are in HTML format
-        if 'State' in schema and schema['State'] == pl.Utf8:
-            # Check if the state column contains the HTML wrapper
-            # Get the first state safely
-            state_series = df_final.select('State').head(1).get_column('State')
-            sample_state_result = None
-            if len(state_series) > 0:
-                 sample_state_result = state_series[0] # Access item using index
+        if 'State' in df_final.columns and pd.api.types.is_string_dtype(df_final['State']): 
+            sample_state_result = df_final['State'].dropna().iloc[0] if not df_final['State'].dropna().empty else None
 
             if sample_state_result and isinstance(sample_state_result, str) and sample_state_result.startswith('<div class="state_cell state-'):
-                 # Extract the state name between > and <
-                 # No .collect() needed here
-                 states_unique_series = df_final.select(
-                     pl.col('State').str.extract(r'>([a-zA-Z]+)<', 1).alias("extracted_state")
-                 ).unique().get_column('extracted_state')
-                 plain_states = states_unique_series.filter(states_unique_series.is_not_null() & (states_unique_series != "")).to_list()
-                 # Capitalize for display in the filter dropdown
-                 metadata['states'] += sorted([s.capitalize() for s in plain_states if s.lower() != 'unknown'])
+                 states_extracted = df_final['State'].str.extract(r'>([a-zA-Z\s]+)<', expand=False).dropna().unique() 
+                 plain_states = [s for s in states_extracted if s != ""]
+                 metadata['states'] += sorted([s.strip().capitalize() for s in plain_states if s.lower().strip() != 'unknown'])
             else:
-                 # Assume plain state names if no HTML detected
-                 # No .collect() needed here
-                 states_unique_series = df_final.select(pl.col('State')).unique().get_column('State')
-                 plain_states = states_unique_series.filter(states_unique_series.is_not_null() & (states_unique_series != "N/A")).to_list()
-                 metadata['states'] += sorted([s.capitalize() for s in plain_states]) # Capitalize for consistency
-
+                 states_unique = df_final['State'].dropna().unique()
+                 plain_states = [s for s in states_unique if s != "N/A"]
+                 metadata['states'] += sorted([s.capitalize() for s in plain_states]) 
 
         # --- Min/Max Values ---
         required_minmax_cols = ['Raw Pledged', 'Raw Goal', 'Raw Raised']
-        if all(col in schema for col in required_minmax_cols):
+        if all(col in df_final.columns for col in required_minmax_cols):
             try:
-                # Aggregations like min/max on an eager DataFrame return a new DataFrame, no .collect()
-                min_max_df = df_final.select([
-                    pl.min('Raw Pledged').alias('min_pledged'),
-                    pl.max('Raw Pledged').alias('max_pledged'),
-                    pl.min('Raw Goal').alias('min_goal'),
-                    pl.max('Raw Goal').alias('max_goal'),
-                    pl.min('Raw Raised').alias('min_raised'),
-                    pl.max('Raw Raised').alias('max_raised') # Use Raw Raised directly
-                ])
+                min_max_stats = df_final[required_minmax_cols].agg(['min', 'max'])
 
-                # Access values using .item() or indexing [0]
-                metadata['min_max_values']['pledged']['min'] = int(min_max_df.item(0, 'min_pledged')) if min_max_df.item(0, 'min_pledged') is not None else 0
-                metadata['min_max_values']['pledged']['max'] = int(min_max_df.item(0, 'max_pledged')) if min_max_df.item(0, 'max_pledged') is not None else 1000
-                metadata['min_max_values']['goal']['min'] = int(min_max_df.item(0, 'min_goal')) if min_max_df.item(0, 'min_goal') is not None else 0
-                metadata['min_max_values']['goal']['max'] = int(min_max_df.item(0, 'max_goal')) if min_max_df.item(0, 'max_goal') is not None else 10000
-                metadata['min_max_values']['raised']['min'] = int(min_max_df.item(0, 'min_raised')) if min_max_df.item(0, 'min_raised') is not None else 0
-                # Use calculated max_raised, ensure it's an int
-                max_raised_calc_val = min_max_df.item(0, 'max_raised')
-                metadata['min_max_values']['raised']['max'] = int(max_raised_calc_val) if max_raised_calc_val is not None else 500
+                metadata['min_max_values']['pledged']['min'] = int(min_max_stats.loc['min', 'Raw Pledged']) if pd.notna(min_max_stats.loc['min', 'Raw Pledged']) else 0
+                metadata['min_max_values']['pledged']['max'] = int(min_max_stats.loc['max', 'Raw Pledged']) if pd.notna(min_max_stats.loc['max', 'Raw Pledged']) else 1000
+                metadata['min_max_values']['goal']['min'] = int(min_max_stats.loc['min', 'Raw Goal']) if pd.notna(min_max_stats.loc['min', 'Raw Goal']) else 0
+                metadata['min_max_values']['goal']['max'] = int(min_max_stats.loc['max', 'Raw Goal']) if pd.notna(min_max_stats.loc['max', 'Raw Goal']) else 10000
+                metadata['min_max_values']['raised']['min'] = int(min_max_stats.loc['min', 'Raw Raised']) if pd.notna(min_max_stats.loc['min', 'Raw Raised']) else 0
+
+                max_raised_calc_val = min_max_stats.loc['max', 'Raw Raised']
+                min_raised = metadata['min_max_values']['raised']['min']
+                calculated_max = int(max_raised_calc_val) if pd.notna(max_raised_calc_val) else 500
+                metadata['min_max_values']['raised']['max'] = max(min_raised, calculated_max)
+
 
                 print("Min/max ranges calculated:", metadata['min_max_values'])
             except Exception as e:
                 print(f"Warning: Error calculating min/max filter ranges: {e}. Using defaults.")
         else:
             print("Warning: Missing columns required for min/max filter ranges. Using defaults.")
-
 
         # --- Save to JSON ---
         with open(output_json_path, 'w', encoding='utf-8') as f:
@@ -347,734 +184,681 @@ def save_filter_metadata(df_final: pl.DataFrame, output_json_path: str):
         print(f"Error calculating or saving filter metadata: {e}")
         print(traceback.format_exc())
 
-def extract_date_from_filename(filename):
+def process_kickstarter_dataframe(df: pd.DataFrame, latest_dataset_date: datetime.date, parquet_output_path: str):
     """
-    Extracts the date (YYYY-MM-DD) from a filename matching the pattern
-    'Kickstarter_YYYY-MM-DDTHH_MM_SS_MSZ...'
-    """
-    match = re.search(r'Kickstarter_(\d{4}-\d{2}-\d{2})T', os.path.basename(filename))
-    if match:
-        date_str = match.group(1)
-        try:
-            # Return a pandas Timestamp which Polars can handle
-            return pd.to_datetime(date_str)
-        except ValueError:
-            print(f"Warning: Could not parse date '{date_str}' from filename '{filename}'.")
-            return None
-    else:
-        print(f"Warning: Could not find date pattern 'Kickstarter_YYYY-MM-DDTHH' in filename '{filename}'.")
-        return None
-
-def json_to_parquet(json_file, parquet_file, halved=False):
-    """
-    Convert a JSON file to Parquet format, performing calculations, cleaning,
-    deduplicating based on project URL, and applying specific filters.
+    Processes the combined Kickstarter DataFrame using Pandas: flattens, calculates fields,
+    deduplicates, filters, converts country codes, calculates popularity,
+    selects final columns, and saves to Parquet.
 
     Args:
-        json_file (str): Path to the JSON file
-        parquet_file (str): Path to save the Parquet file
-        halved (bool): If True, only process half of the entries
+        df (pd.DataFrame): Combined DataFrame from all JSON files.
+        latest_dataset_date (datetime.date): The date extracted from the latest input file.
+        parquet_output_path (str): Path to save the final Parquet file.
 
     Returns:
         bool: True if successful, False otherwise
     """
-    print(f"Converting {json_file} to Parquet format..." + (" (halved dataset)" if halved else ""))
+    print(f"\n--- Starting DataFrame Processing ({len(df)} rows) ---")
     start_time = time.time()
 
     try:
-        # --- Extract Dataset Creation Date ---
-        dataset_creation_datetime = extract_date_from_filename(json_file)
-
-        # Read the JSON file line by line
-        records = []
-        line_count = 0
-        total_lines = 0
-
-        if halved:
-            with open(json_file, 'r', encoding='utf-8', errors='replace') as f:
-                total_lines = sum(1 for _ in f)
-            target_lines = total_lines // 2
-            print(f"Total JSON lines: {total_lines}, processing approximately {target_lines} lines")
-
-        with open(json_file, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                line_count += 1
-                if halved and line_count > total_lines // 2:
-                    break
-                try:
-                    record = json.loads(line)
-                    if 'data' in record:
-                        # Store run_id if present at the top level
-                        if 'run_id' in record:
-                            record['data']['run_id'] = record['run_id']
-                        # Basic type checking for numeric fields
-                        for key in ['goal', 'pledged', 'backers_count', 'converted_pledged_amount', 'state_changed_at', 'updated_at', 'run_id', 'created_at', 'deadline']: # Added date fields
-                            if key in record['data'] and not isinstance(record['data'][key], (int, float)):
-                                try:
-                                    # Try casting to float first, then int if it fails or key is run_id/date
-                                    if key in ['run_id', 'created_at', 'deadline', 'state_changed_at', 'updated_at']:
-                                         record['data'][key] = int(record['data'][key]) if record['data'][key] is not None else 0
-                                    else:
-                                         record['data'][key] = float(record['data'][key]) if record['data'][key] is not None else 0.0
-                                except (ValueError, TypeError):
-                                     # Ensure 'state' gets a default if conversion fails, other numeric default to 0
-                                     if key == 'state':
-                                         record['data'][key] = "unknown" # Or another appropriate default
-                                     else:
-                                         record['data'][key] = 0
-                        records.append(record['data'])
-                except json.JSONDecodeError:
-                    print(f"Skipping invalid JSON line: {line_count}")
-                    continue
-                except Exception as e:
-                    print(f"Error processing line {line_count}: {e}")
-                    continue
-
-
-        print(f"Processed {line_count} lines into {len(records)} records")
-        if not records:
-             print("No valid records found. Aborting Parquet conversion.")
+        if df.empty: 
+             print("Input DataFrame is empty. Skipping processing.")
              return False
 
-        # Convert list of dicts to Polars DataFrame directly
-        df = pl.DataFrame(records)
+        # --- Flatten nested structures ---
+        def safe_get(data, keys, default=None):
+            """Safely get nested dictionary keys."""
+            try:
+                for key in keys:
+                    data = data[key]
+                return data
+            except (KeyError, TypeError, IndexError):
+                return default
 
-        print("Initial Polars DataFrame created. Starting transformations...")
+        # Flatten 'urls.web.project'
+        try:
+            web_project_url_col = 'urls.web.project'
+            if 'urls' in df.columns and isinstance(df['urls'].iloc[0], dict):
+                 df[web_project_url_col] = df['urls'].apply(lambda x: safe_get(x, ['web', 'project']))
+                 print("Flattened 'urls.web.project' using .apply()")
+            elif web_project_url_col not in df.columns: 
+                 print("Warning: 'urls' column or nested structure 'web.project' not found. Creating dummy column.")
+                 df[web_project_url_col] = None
+            else:
+                 print(f"Column '{web_project_url_col}' seems to exist or 'urls' is not a dict column.")
+                 pass 
 
-        # --- Start Polars Transformations ---
+        except Exception as e:
+            print(f"Warning: Error trying to flatten 'urls.web.project': {e}. Creating dummy column.")
+            df['urls.web.project'] = None
+            web_project_url_col = 'urls.web.project'
 
-        # Flatten nested JSON structures needed for deduplication key (URL)
-        # and potentially for sort key (though run_id and state_changed_at are usually top-level)
-        url_flattened = False
-        if 'urls' in df.columns:
-             print("Flattening column: urls")
-             # Ensure 'urls' is struct type before accessing fields
-             if isinstance(df['urls'].dtype, pl.Struct):
-                 # Check for urls.web.project path specifically
-                 if 'web' in df['urls'].struct.fields and isinstance(df['urls'].struct.field('web').dtype, pl.Struct) and 'project' in df['urls'].struct.field('web').struct.fields:
-                     df = df.with_columns(pl.col('urls').struct.field('web').struct.field('project').alias('urls.web.project'))
-                     url_flattened = True
-                 else:
-                      print("Warning: Could not find 'urls.web.project' structure.")
-             else:
-                 print("Warning: 'urls' column is not a struct type, cannot flatten.")
+        # --- Deduplication Step (Based on URL) ---
+        deduplication_key_col = web_project_url_col 
 
-
-        # --- Deduplication Step ---
-        deduplication_key_col = 'urls.web.project'
-        sort_key_options = ['state_changed_at', 'run_id', 'updated_at', 'created_at'] # Order of preference
-
-        if not url_flattened or deduplication_key_col not in df.columns:
-             print(f"Error: Deduplication key column '{deduplication_key_col}' not found or couldn't be flattened. Skipping deduplication.")
+        if deduplication_key_col not in df.columns:
+             print(f"Error: Deduplication key column '{deduplication_key_col}' not found. Skipping deduplication.")
         else:
-             # Find the best available sort key column
-             sort_key_col = None
-             for key in sort_key_options:
-                 if key in df.columns:
-                     sort_key_col = key
-                     print(f"Using '{sort_key_col}' as the sort key for deduplication.")
-                     break
+            print(f"Cleaning deduplication key column: '{deduplication_key_col}'")
+            original_rows = len(df)
+            df[deduplication_key_col] = df[deduplication_key_col].fillna("__MISSING_OR_EMPTY_URL__")
+            df[deduplication_key_col] = df[deduplication_key_col].replace("", "__MISSING_OR_EMPTY_URL__")
+            df[deduplication_key_col] = df[deduplication_key_col].astype(str) 
+            print(f"Finished cleaning '{deduplication_key_col}'. Null/empty strings replaced.")
 
-             if sort_key_col:
-                 # Ensure the sort key is numeric (Int or Float) or Datetime for proper sorting
-                 # We'll assume timestamps are Unix epoch seconds (Int64) based on previous logic
-                 # Handle potential nulls by filling them with a value that sorts last (0 or epoch start)
-                 print(f"Preparing sort key '{sort_key_col}'...")
-                 df = df.with_columns(
-                     pl.col(sort_key_col).cast(pl.Int64, strict=False).fill_null(0).alias(sort_key_col)
-                 )
-                 # Also ensure the deduplication key (URL) is Utf8 and handle nulls
-                 df = df.with_columns(
-                     pl.col(deduplication_key_col).cast(pl.Utf8, strict=False).fill_null("__MISSING_URL__").alias(deduplication_key_col)
-                 )
+            print(f"Applying unique constraint on '{deduplication_key_col}', keeping first encountered record...")
+            df = df.drop_duplicates(subset=[deduplication_key_col], keep='first', ignore_index=True) 
+            removed_rows = original_rows - len(df)
+            print(f"Removed {removed_rows} duplicate rows based on project URL ('{deduplication_key_col}'). Kept first encountered instance.")
 
-                 original_rows = df.height
-                 print(f"Sorting by '{deduplication_key_col}' (asc) and '{sort_key_col}' (desc) for deduplication...")
-                 # Sort by URL, then by the sort key descending (latest/highest first)
-                 df = df.sort(deduplication_key_col, sort_key_col, descending=[False, True])
-
-                 print(f"Applying unique constraint on '{deduplication_key_col}', keeping first (latest)...")
-                 df = df.unique(subset=[deduplication_key_col], keep='first', maintain_order=True) # maintain_order=True is default but explicit
-                 removed_rows = original_rows - df.height
-                 print(f"Removed {removed_rows} duplicate rows based on project URL.")
-
-             else:
-                 print("Warning: No suitable sort key found among options. Skipping deduplication based on latest update.")
-                 # Optionally, could deduplicate just by URL keeping *any* first instance:
-                 # print(f"Applying unique constraint on '{deduplication_key_col}', keeping first encountered...")
-                 # df = df.with_columns(pl.col(deduplication_key_col).cast(pl.Utf8, strict=False).fill_null("__MISSING_URL__").alias(deduplication_key_col))
-                 # original_rows = df.height
-                 # df = df.unique(subset=[deduplication_key_col], keep='first', maintain_order=True)
-                 # removed_rows = original_rows - df.height
-                 # print(f"Removed {removed_rows} duplicate rows based on project URL (kept first encountered).")
-
-
-        # --- Continue with other transformations on the deduplicated DataFrame ---
-
-        # Flatten remaining nested structures if needed for selection
-        nested_structures = {
+        # --- Flatten remaining structures needed ---
+        flatten_cols = {
             'category': ['name', 'parent_name'],
             'creator': ['name'],
-            'location': ['country', 'expanded_country'],
-            # 'urls' was handled above for deduplication
+            'location': ['country', 'expanded_country', 'displayable_name']
         }
-        for base_col, fields in nested_structures.items():
-             if base_col in df.columns and isinstance(df[base_col].dtype, pl.Struct): # Check if it's a struct
+        for base_col, fields in flatten_cols.items():
+             if base_col in df.columns and isinstance(df[base_col].iloc[0], dict): 
                  print(f"Flattening column: {base_col}")
-                 expressions = []
                  for field in fields:
-                      # Check if field exists within the struct
-                      if field in df[base_col].struct.fields:
-                          new_col_name = f"{base_col}.{field}"
-                          expressions.append(pl.col(base_col).struct.field(field).alias(new_col_name))
-                      else:
-                          print(f"Warning: Field '{field}' not found in struct '{base_col}'.")
-                 if expressions:
-                      df = df.with_columns(expressions)
+                     new_col_name = f"{base_col}.{field}"
+                     try:
+                         if field in df[base_col].dropna().iloc[0]:
+                             df[new_col_name] = df[base_col].apply(lambda x: safe_get(x, [field]))
+                         else:
+                              print(f"  Warning: Field '{field}' not found in first non-null item of '{base_col}'. Skipping {new_col_name}.")
+                              if new_col_name not in df.columns: df[new_col_name] = None 
+                     except IndexError: 
+                          print(f"  Warning: Column '{base_col}' contains no non-null dictionary values. Skipping flattening.")
+                          if new_col_name not in df.columns: df[new_col_name] = None
+                     except Exception as e:
+                          print(f"  Warning: Error flattening {base_col}.{field}: {e}. Skipping {new_col_name}.")
+                          if new_col_name not in df.columns: df[new_col_name] = None
+             elif base_col in df.columns:
+                 print(f"  Warning: Column '{base_col}' exists but is not a dict type. Cannot flatten further.")
+             else:
+                 for field in fields:
+                     new_col_name = f"{base_col}.{field}"
+                     if new_col_name not in df.columns: df[new_col_name] = None
 
 
-        print("Nested structure flattening complete.")
+        print("Structure flattening complete.")
 
-        # Find the correct column names using safe_column_access
+        # --- Column Access and Calculations ---
         goal_col = safe_column_access(df, ['goal'])
         exchange_rate_col = safe_column_access(df, ['usd_exchange_rate', 'static_usd_rate'])
         pledged_col = safe_column_access(df, ['converted_pledged_amount', 'pledged'])
         created_col = safe_column_access(df, ['created_at'])
-        deadline_col = safe_column_access(df, ['deadline']) # Keep original name for processing
+        deadline_col = safe_column_access(df, ['deadline'])
         backers_col = safe_column_access(df, ['backers_count'])
         name_col = safe_column_access(df, ['name'])
-        creator_col = safe_column_access(df, ['creator.name'])
-        link_col = safe_column_access(df, ['urls.web.project']) # Use the flattened URL column
-        country_expanded_col = safe_column_access(df, ['location.expanded_country'])
-        state_col = safe_column_access(df, ['state']) # Keep original name for processing
-        category_col = safe_column_access(df, ['category.parent_name'])
-        subcategory_col = safe_column_access(df, ['category.name'])
-        country_code_col = safe_column_access(df, ['location.country'])
-        # Add safe access for the displayable country name
-        country_displayable_name_col = safe_column_access(df, ['country_displayable_name'])
+        creator_name_col = safe_column_access(df, ['creator.name'])
+        loc_country_col = safe_column_access(df, ['location.country'])
+        state_col = safe_column_access(df, ['state'])
+        category_parent_col = safe_column_access(df, ['category.parent_name']) 
+        category_name_col = safe_column_access(df, ['category.name']) 
+        top_level_country_col = safe_column_access(df, ['country']) 
 
-        # Calculate and store raw values
-        if goal_col and exchange_rate_col:
-             df = df.with_columns([
-                  pl.col(goal_col).cast(pl.Float64, strict=False).fill_null(0.0),
-                  pl.col(exchange_rate_col).cast(pl.Float64, strict=False).fill_null(1.0)
-             ])
-             df = df.with_columns(
-                  (pl.col(goal_col) * pl.col(exchange_rate_col)).alias('Raw Goal')
-             )
-             df = df.with_columns(
-                  pl.when(pl.col('Raw Goal') < 1.0).then(1.0).otherwise(pl.col('Raw Goal')).alias('Raw Goal')
-             )
-        else:
-             print("Warning: 'goal' or 'usd_exchange_rate'/'static_usd_rate' column not found. Setting 'Raw Goal' to 1.0.")
-             df = df.with_columns(pl.lit(1.0).cast(pl.Float64).alias('Raw Goal'))
-
+        # --- Calculations (Raw Goal, Pledged, Raised) ---
+        if goal_col:
+             df[goal_col] = pd.to_numeric(df[goal_col], errors='coerce').fillna(0.0)
+        if exchange_rate_col:
+             df[exchange_rate_col] = pd.to_numeric(df[exchange_rate_col], errors='coerce').fillna(1.0)
         if pledged_col:
-             df = df.with_columns(
-                  pl.col(pledged_col).cast(pl.Float64, strict=False).fill_null(0.0).alias('Raw Pledged')
-             )
-        else:
-             print("Warning: 'converted_pledged_amount'/'pledged' column not found. Setting 'Raw Pledged' to 0.0.")
-             df = df.with_columns(pl.lit(0.0).cast(pl.Float64).alias('Raw Pledged'))
+            df[pledged_col] = pd.to_numeric(df[pledged_col], errors='coerce').fillna(0.0)
 
-        df = df.with_columns(
-             pl.when((pl.col('Raw Pledged') <= 0.0) | (pl.col('Raw Goal') <= 0.0))
-             .then(0.0)
-             .otherwise((pl.col('Raw Pledged') / pl.col('Raw Goal')) * 100.0)
-             .alias('Raw Raised')
-             .cast(pl.Float64)
+        # Goal Calculation
+        if goal_col and exchange_rate_col:
+            df['Raw Goal'] = (df[goal_col] * df[exchange_rate_col])
+            df['Raw Goal'] = df['Raw Goal'].clip(lower=1.0)
+        elif goal_col:
+             print("Warning: Exchange rate column not found. Using 'goal' directly for 'Raw Goal'.")
+             df['Raw Goal'] = df[goal_col].clip(lower=1.0) 
+        else:
+            print("Warning: 'goal' column not found. Setting 'Raw Goal' to default 1.0.")
+            df['Raw Goal'] = 1.0
+
+        df['Raw Goal'] = df['Raw Goal'].astype(float)
+
+        # Pledged Calculation
+        if pledged_col:
+            df['Raw Pledged'] = df[pledged_col].astype(float) 
+        else:
+            print("Warning: 'pledged'/'converted_pledged_amount' column not found. Setting 'Raw Pledged' to 0.0.")
+            df['Raw Pledged'] = 0.0
+        df['Raw Pledged'] = df['Raw Pledged'].astype(float)
+
+        # Raised Calculation
+        df['Raw Raised'] = np.where(
+            (df['Raw Pledged'] <= 0.0) | (df['Raw Goal'] <= 0.0), 
+            0.0,                                                
+            (df['Raw Pledged'] / df['Raw Goal']) * 100.0     
         )
+        df['Raw Raised'] = df['Raw Raised'].fillna(0.0).astype(float)
 
-        # Dates: Convert Unix timestamp
-        default_date = pl.lit(pd.to_datetime('2000-01-01')).cast(pl.Datetime)
-        if created_col:
-            # Try converting assuming seconds epoch first, fallback for milliseconds if error
-            try:
-                 df = df.with_columns(
-                      pl.from_epoch(pl.col(created_col).cast(pl.Int64, strict=True), time_unit="s")
-                      .fill_null(default_date)
-                      .alias('Raw Date')
-                 )
-            except pl.ComputeError:
-                 print(f"Warning: Casting '{created_col}' to Int64 seconds epoch failed, trying milliseconds.")
-                 try:
-                      df = df.with_columns(
-                           pl.from_epoch(pl.col(created_col).cast(pl.Int64, strict=True), time_unit="ms")
-                           .fill_null(default_date)
-                           .alias('Raw Date')
-                      )
-                 except Exception as e_ms:
-                      print(f"Warning: Casting '{created_col}' to Int64 ms epoch also failed ({e_ms}). Setting default date.")
-                      df = df.with_columns(default_date.alias('Raw Date'))
-            except Exception as e_other:
-                 print(f"Warning: Error casting '{created_col}' ({e_other}). Setting default date.")
-                 df = df.with_columns(default_date.alias('Raw Date'))
+        # --- Date Conversions (Raw Date, Raw Deadline) ---
+        default_datetime_pd = pd.Timestamp("2000-01-01", tz='UTC') 
+
+        def convert_epoch_to_datetime_pd(series):
+            """Helper to convert epoch (s or ms) Series to Datetime, handling errors."""
+            dt_series = pd.to_datetime(series, unit='s', errors='coerce', utc=True)
+            first_valid = dt_series.dropna().iloc[0] if not dt_series.dropna().empty else None
+            if dt_series.isnull().sum() > len(series) * 0.5 or (first_valid and first_valid.year < 1971):
+                 print("  Trying milliseconds conversion for some values...")
+                 dt_series_ms = pd.to_datetime(series, unit='ms', errors='coerce', utc=True)
+                 dt_series = dt_series.fillna(dt_series_ms)
+
+            return dt_series.fillna(default_datetime_pd) 
+
+        if created_col and created_col in df.columns:
+             df[created_col] = pd.to_numeric(df[created_col], errors='coerce')
+             df['Raw Date'] = convert_epoch_to_datetime_pd(df[created_col])
         else:
-            print("Warning: 'created_at' column not found. Setting 'Raw Date' to default.")
-            df = df.with_columns(default_date.alias('Raw Date'))
+             print(f"Warning: Column '{created_col}' not found for date conversion. Setting 'Raw Date' to default.")
+             df['Raw Date'] = default_datetime_pd
 
-        if deadline_col:
-             try:
-                  df = df.with_columns(
-                       pl.from_epoch(pl.col(deadline_col).cast(pl.Int64, strict=True), time_unit="s")
-                       .fill_null(default_date)
-                       .alias('Raw Deadline')
-                  )
-             except pl.ComputeError:
-                  print(f"Warning: Casting '{deadline_col}' to Int64 seconds epoch failed, trying milliseconds.")
-                  try:
-                       df = df.with_columns(
-                           pl.from_epoch(pl.col(deadline_col).cast(pl.Int64, strict=True), time_unit="ms")
-                           .fill_null(default_date)
-                           .alias('Raw Deadline')
-                       )
-                  except Exception as e_ms:
-                       print(f"Warning: Casting '{deadline_col}' to Int64 ms epoch also failed ({e_ms}). Setting default date.")
-                       df = df.with_columns(default_date.alias('Raw Deadline'))
-             except Exception as e_other:
-                  print(f"Warning: Error casting '{deadline_col}' ({e_other}). Setting default date.")
-                  df = df.with_columns(default_date.alias('Raw Deadline'))
+        if deadline_col and deadline_col in df.columns:
+             df[deadline_col] = pd.to_numeric(df[deadline_col], errors='coerce')
+             df['Raw Deadline'] = convert_epoch_to_datetime_pd(df[deadline_col])
         else:
-            print("Warning: 'deadline' column not found. Setting 'Raw Deadline' to default.")
-            df = df.with_columns(default_date.alias('Raw Deadline'))
+             print(f"Warning: Column '{deadline_col}' not found for date conversion. Setting 'Raw Deadline' to default.")
+             df['Raw Deadline'] = default_datetime_pd
 
-        # --- Apply Deadline/State Filter ---
-        # Filter rows where Raw Deadline is before the dataset creation date
-        # AND the original 'state' (before aliasing/selection) is 'live', 'submitted', or 'started'.
-        if dataset_creation_datetime:
-            dataset_creation_date_pl = pl.lit(dataset_creation_datetime).cast(pl.Datetime)
-            # Check if required columns exist for filtering
-            if state_col and state_col in df.columns and 'Raw Deadline' in df.columns and df['Raw Deadline'].dtype == pl.Datetime:
-                initial_rows = df.height
-                print(f"Applying filter: Removing rows where Raw Deadline < {dataset_creation_datetime.date()} AND state is live/submitted/started...")
+        df['Raw Date'] = pd.to_datetime(df['Raw Date'], utc=True)
+        df['Raw Deadline'] = pd.to_datetime(df['Raw Deadline'], utc=True)
 
-                # Ensure 'state' column is treated as string for comparison
-                state_col_expr = pl.col(state_col).cast(pl.Utf8, strict=False).fill_null("").str.to_lowercase()
 
-                # Condition to identify rows TO REMOVE
+        # --- Deadline/State Filter ---
+        if latest_dataset_date:
+            dataset_creation_dt_pd = pd.Timestamp(latest_dataset_date, tz='UTC') 
+
+            if state_col and state_col in df.columns and 'Raw Deadline' in df.columns and pd.api.types.is_datetime64_any_dtype(df['Raw Deadline']):
+                initial_rows = len(df)
+                print(f"Applying filter: Removing rows where Raw Deadline < {latest_dataset_date} AND original state is live/submitted/started...")
+
+                state_series = df[state_col].astype(str).fillna("").str.lower()
+
                 remove_condition = (
-                    (pl.col('Raw Deadline') < dataset_creation_date_pl) &
-                    (state_col_expr.is_in(['live', 'submitted', 'started']))
+                    (df['Raw Deadline'] < dataset_creation_dt_pd) &
+                    (state_series.isin(['live', 'submitted', 'started']))
                 )
 
-                # Filter to KEEP rows that DO NOT match the remove condition
-                df = df.filter(~remove_condition)
+                df = df[~remove_condition].reset_index(drop=True)
 
-                removed_count = initial_rows - df.height
+                removed_count = initial_rows - len(df)
                 print(f"Removed {removed_count} rows based on deadline/state filter.")
             else:
                 missing_cols_warn = []
                 if not (state_col and state_col in df.columns):
                     missing_cols_warn.append(f"'{state_col}' (original state)")
-                if 'Raw Deadline' not in df.columns or df['Raw Deadline'].dtype != pl.Datetime:
+                if 'Raw Deadline' not in df.columns or not pd.api.types.is_datetime64_any_dtype(df['Raw Deadline']):
                      missing_cols_warn.append("'Raw Deadline' (Datetime)")
                 print(f"Warning: Skipping deadline/state filter due to missing/incorrect columns: {', '.join(missing_cols_warn)}.")
         else:
-            print("Warning: Skipping deadline/state filter because dataset creation date could not be determined from filename.")
+            print("Warning: Skipping deadline/state filter because latest dataset date was not provided.")
 
 
-        # Backer count
-        if backers_col:
-            df = df.with_columns(
-                 pl.col(backers_col).cast(pl.Int64, strict=False).fill_null(0).alias('Backer Count')
-            )
+        # --- Backer Count ---
+        if backers_col and backers_col in df.columns:
+             df['Backer Count'] = pd.to_numeric(df[backers_col], errors='coerce').fillna(0).astype('Int64')
         else:
             print("Warning: 'backers_count' column not found. Setting 'Backer Count' to 0.")
-            df = df.with_columns(pl.lit(0).cast(pl.Int64).alias('Backer Count'))
+            df['Backer Count'] = 0
+            df['Backer Count'] = df['Backer Count'].astype('Int64') 
 
+        # --- Country Code Replacement ---
+        print("Applying country code conversion...")
+        country_col_final = 'Country'
+        country_code_source_col = '__country_code_source' 
 
-        # Format display columns
-        df = df.with_columns(
-            pl.col('Raw Goal').fill_null(0.0).round(2).alias('Goal'),
-            pl.col('Raw Pledged').fill_null(0.0).round(2).alias('Pledged Amount'),
-            pl.col('Raw Raised').fill_null(0.0).round(2).alias('%Raised'),
-            pl.col('Raw Date').dt.strftime('%Y-%m-%d').fill_null('N/A').alias('Date'),
-            pl.col('Raw Deadline').dt.strftime('%Y-%m-%d').fill_null('N/A').alias('Deadline')
-        )
-
-        # --- Select final columns ---
-        # Use the Polars DataFrame `df` which has been filtered and deduplicated
-        select_expressions = []
-        # Add calculated display columns
-        calculated_display_cols = ['Pledged Amount', 'Date', 'Deadline', 'Goal', '%Raised']
-        for col in calculated_display_cols:
-            if col in df.columns: select_expressions.append(pl.col(col))
-            else: print(f"Error: Display column '{col}' missing.")
-
-        # Add raw values needed for frontend logic/filters
-        raw_value_cols = ['Raw Goal', 'Raw Pledged', 'Raw Raised', 'Raw Date', 'Raw Deadline', 'Backer Count']
-        for col in raw_value_cols:
-             if col in df.columns: select_expressions.append(pl.col(col))
-             else: print(f"Error: Raw value column '{col}' missing.")
-
-        # --- Build Special Columns: Country and Category ---
-
-        # Country: Prioritize expanded > displayable > code. Clean "the ".
-        country_expr = pl.lit("N/A").cast(pl.Utf8) # Default value
-        # Build the expression conditionally based on column existence and content
-        # Innermost fallback: location.country (country_code_col)
-        if country_code_col and country_code_col in df.columns:
-             country_expr = pl.when((pl.col(country_code_col).is_not_null()) & (pl.col(country_code_col) != "N/A")) \
-                              .then(pl.col(country_code_col)) \
-                              .otherwise(country_expr)
-        # Middle fallback: country_displayable_name
-        if country_displayable_name_col and country_displayable_name_col in df.columns:
-             country_expr = pl.when((pl.col(country_displayable_name_col).is_not_null()) & (pl.col(country_displayable_name_col) != "N/A")) \
-                              .then(pl.col(country_displayable_name_col)) \
-                              .otherwise(country_expr) # Fallback to location.country or "N/A"
-        # Highest priority: location.expanded_country
-        if country_expanded_col and country_expanded_col in df.columns:
-             country_expr = pl.when((pl.col(country_expanded_col).is_not_null()) & (pl.col(country_expanded_col) != "N/A")) \
-                              .then(pl.col(country_expanded_col)) \
-                              .otherwise(country_expr) # Fallback to displayable_name or location.country or "N/A"
-
-        # Apply string replacements and alias
-        select_expressions.append(
-             country_expr.fill_null("N/A")
-                         .str.replace("the United States", "United States", literal=True)
-                         .str.replace("the United Kingdom", "United Kingdom", literal=True)
-                         .alias('Country')
-        )
-
-        # Category: Prioritize parent_name > name.
-        category_expr = pl.lit("N/A").cast(pl.Utf8) # Default value
-        # Build the expression conditionally
-        # Fallback: category.name (subcategory_col)
-        if subcategory_col and subcategory_col in df.columns:
-            category_expr = pl.when((pl.col(subcategory_col).is_not_null()) & (pl.col(subcategory_col) != "N/A")) \
-                             .then(pl.col(subcategory_col)) \
-                             .otherwise(category_expr)
-        # Primary: category.parent_name (category_col)
-        if category_col and category_col in df.columns:
-            category_expr = pl.when((pl.col(category_col).is_not_null()) & (pl.col(category_col) != "N/A")) \
-                             .then(pl.col(category_col)) \
-                             .otherwise(category_expr) # Fallback to category.name or "N/A"
-
-        # Add the expression, ensuring nulls are handled and aliased
-        select_expressions.append(
-             category_expr.fill_null("N/A").alias('Category')
-        )
-
-
-        # Add other required columns (potentially flattened)
-        # Remove Country and Category as they are handled above
-        other_required_cols = {
-            'Project Name': name_col,
-            'Creator': creator_col,
-            'Link': link_col, # Use the flattened URL column name used for deduplication
-            # 'Country': country_expanded_col, # Handled above
-            'State': state_col, # Use original state col name, will be selected/aliased
-            # 'Category': category_col, # Handled above
-            'Subcategory': subcategory_col,
-            'Country Code': country_code_col,
-        }
-        for final_name, source_col_name in other_required_cols.items():
-            if source_col_name and source_col_name in df.columns:
-                # Select and alias if necessary, ensure Utf8 and fill nulls
-                select_expressions.append(
-                    pl.col(source_col_name).cast(pl.Utf8, strict=False).fill_null("N/A").alias(final_name)
-                )
+        df[country_code_source_col] = None 
+        if loc_country_col and loc_country_col in df.columns:
+            df[country_code_source_col] = df[loc_country_col]
+            print(f"Using '{loc_country_col}' as primary country code source.")
+            if top_level_country_col and top_level_country_col in df.columns:
+                df[country_code_source_col] = df[country_code_source_col].fillna(df[top_level_country_col])
+                print(f"Using '{top_level_country_col}' as fallback country code source.")
             else:
-                print(f"Warning: Source column '{source_col_name}' for '{final_name}' not found. Creating default 'N/A'.")
-                select_expressions.append(pl.lit("N/A").cast(pl.Utf8).alias(final_name))
+                print("Top-level 'country' column not found for fallback.")
+        elif top_level_country_col and top_level_country_col in df.columns:
+            df[country_code_source_col] = df[top_level_country_col]
+            print(f"Primary source '{loc_country_col}' not found. Using '{top_level_country_col}' as country code source.")
+        else:
+            print(f"Warning: Neither '{loc_country_col}' nor '{top_level_country_col}' found. Cannot determine country codes.")
+            df[country_col_final] = "N/A" 
 
-        # Select the final set of columns
-        df_final = df.select(select_expressions)
+        if country_code_source_col in df.columns:
+            country_mapping = {}
+            try:
+                 unique_codes = df[country_code_source_col].dropna().astype(str).unique()
+            except Exception as e:
+                 print(f"Warning: Could not extract unique country codes from '{country_code_source_col}': {e}. Mapping might be incomplete.")
+                 unique_codes = []
 
-        print("Columns in df_final before popularity score:", df_final.columns)
+            for code in unique_codes:
+                if isinstance(code, str) and len(code) == 2:
+                    try:
+                        country = coco.convert(names=code.upper(), to='name_short')
+                        if country:
+                            country_mapping[code.upper()] = country
+                    except Exception:
+                        pass
+                    
+            country_mapping['XK'] = 'Kosovo' # Add Kosovo mapping
+
+            print(f"Found {len(country_mapping)} valid country code mappings (including XK).")
+
+            # --- Apply mapping using .map() ---
+            df[country_col_final] = df[country_code_source_col].astype(str).str.upper().map(country_mapping).fillna("N/A")
+            df[country_col_final] = df[country_col_final].str.replace("the United States", "United States", regex=False)
+            df[country_col_final] = df[country_col_final].str.replace("the United Kingdom", "United Kingdom", regex=False)
+
+            print(f"Created '{country_col_final}' column using codes from '{country_code_source_col}' via .map(). Invalid/missing codes set to 'N/A'.")
+            df.drop(columns=[country_code_source_col], inplace=True) 
+
+        elif country_col_final not in df.columns:
+             df[country_col_final] = "N/A"
+
+        # --- Category Selection ---
+        category_col_final = 'Category'
+        subcategory_col_final = 'Subcategory'
+
+        raw_parent_col_name = 'category.parent_name'
+        raw_name_col_name = 'category.name'
+
+        category_parent_col = safe_column_access(df, [raw_parent_col_name])
+        if not category_parent_col:
+            print(f"Warning: Source column for parent category ('{raw_parent_col_name}') not found. Creating dummy.")
+            df[raw_parent_col_name] = "N/A"
+            category_parent_col = raw_parent_col_name 
+        df[category_parent_col] = df[category_parent_col].astype(str).fillna("N/A")
+
+        category_name_col = safe_column_access(df, [raw_name_col_name])
+        if not category_name_col:
+            print(f"Warning: Source column for category name ('{raw_name_col_name}') not found. Creating dummy.")
+            df[raw_name_col_name] = "N/A"
+            category_name_col = raw_name_col_name 
+        df[category_name_col] = df[category_name_col].astype(str).fillna("N/A")
+
+        df[category_col_final] = np.where(
+            (df[category_parent_col] != "N/A") & (df[category_parent_col] != ""), 
+            df[category_parent_col],   
+            np.where( 
+                 (df[category_name_col] != "N/A") & (df[category_name_col] != ""),
+                 df[category_name_col],                               
+                 "N/A"                                    
+            )
+        )
+
+        df[subcategory_col_final] = df[category_name_col]
+
+        # --- Format Display Columns ---
+        df['Goal'] = df['Raw Goal'].round(2)
+        df['Pledged Amount'] = df['Raw Pledged'].round(2)
+        df['%Raised'] = df['Raw Raised'].round(2)
+
+        df['Date'] = df['Raw Date'].dt.strftime('%Y-%m-%d').fillna('N/A')
+        df['Deadline'] = df['Raw Deadline'].dt.strftime('%Y-%m-%d').fillna('N/A')
+
+        print("Adjusting categories: Imputing missing Category based on Subcategory mode...")
+
+        if category_col_final not in df.columns:
+             print(f"Error: Column '{category_col_final}' missing before final adjustment. Creating default.")
+             df[category_col_final] = "N/A"
+        if subcategory_col_final not in df.columns:
+             print(f"Error: Column '{subcategory_col_final}' missing before final adjustment. Creating default.")
+             df[subcategory_col_final] = "N/A"
+        df[category_col_final] = df[category_col_final].astype(str).fillna("N/A")
+        df[subcategory_col_final] = df[subcategory_col_final].astype(str).fillna("N/A")
+
+        invalid_values = ['N/A', 'None', ''] 
+
+        category_is_invalid_mask = df[category_col_final].isnull() | df[category_col_final].isin(invalid_values)
+        print(f"Found {category_is_invalid_mask.sum()} rows with invalid Category.")
+
+        if category_is_invalid_mask.any():
+            valid_category_mask = ~df[category_col_final].isin(invalid_values) & df[category_col_final].notnull()
+            valid_subcategory_mask = ~df[subcategory_col_final].isin(invalid_values) & df[subcategory_col_final].notnull()
+            valid_pairs_df = df.loc[valid_category_mask & valid_subcategory_mask, [category_col_final, subcategory_col_final]].copy()
+
+            subcategory_to_most_common_category = {} 
+            valid_category_set = set()         
+
+            if not valid_pairs_df.empty:
+                print("Calculating most common category for each subcategory (for fallback)...")
+                try:
+                    mode_series = valid_pairs_df.groupby(subcategory_col_final)[category_col_final].agg(lambda x: x.mode()[0] if not x.mode().empty else "N/A")
+                    subcategory_to_most_common_category = mode_series.to_dict()
+                    print(f"Created mode mapping for {len(subcategory_to_most_common_category)} subcategories.")
+                except Exception as e:
+                    print(f"Warning: Error calculating subcategory modes: {e}. Mode fallback might be incomplete.")
+
+                print("Identifying valid categories (where Category != Subcategory)...")
+                valid_categories_where_different = valid_pairs_df[valid_pairs_df[category_col_final] != valid_pairs_df[subcategory_col_final]][category_col_final]
+                valid_category_set = set(valid_categories_where_different.unique())
+                valid_category_set = {cat for cat in valid_category_set if cat not in invalid_values and pd.notna(cat)}
+                print(f"Found {len(valid_category_set)} unique valid categories meeting the criteria.")
+
+            else:
+                print("No valid Category/Subcategory pairs found to build imputation map or valid category set.")
+
+            print("Applying imputation logic to rows with invalid Category...")
+            imputed_count_direct = 0
+            imputed_count_mode = 0
+            failed_imputation_count = 0
+
+            indices_to_impute = df[category_is_invalid_mask].index
+
+            new_categories = df[category_col_final].copy()
+
+            for idx in indices_to_impute:
+                current_subcat = df.loc[idx, subcategory_col_final]
+
+                if current_subcat in invalid_values or pd.isna(current_subcat):
+                     new_categories.loc[idx] = "N/A" 
+                     failed_imputation_count += 1
+                     continue
+
+                if current_subcat in valid_category_set:
+                    new_categories.loc[idx] = current_subcat
+                    imputed_count_direct += 1
+                else:
+                    most_common_cat = subcategory_to_most_common_category.get(current_subcat, "N/A")
+                    new_categories.loc[idx] = most_common_cat
+                    if most_common_cat != "N/A":
+                        imputed_count_mode += 1
+                    else:
+                        failed_imputation_count += 1 
+
+            df[category_col_final] = new_categories
+
+            print(f"Imputation summary: ")
+            print(f"  - Directly imputed using Subcategory value: {imputed_count_direct}")
+            print(f"  - Imputed using mode Category: {imputed_count_mode}")
+            print(f"  - Failed to impute (remains N/A): {failed_imputation_count}")
+
+        else:
+             print("No invalid categories found requiring adjustment.")
+
+        df[category_col_final] = df[category_col_final].astype(str).fillna("N/A")
+        df[subcategory_col_final] = df[subcategory_col_final].astype(str).fillna("N/A")
+
+        # --- Select and Alias Final Columns ---
+        print("Selecting final columns...")
+        final_columns_mapping = {
+            'Project Name': name_col,
+            'Creator': creator_name_col,
+            'Link': web_project_url_col,
+            'Date': 'Date', 
+            'Deadline': 'Deadline',
+            'State': state_col,
+            'Country': country_col_final,
+            'Category': category_col_final,
+            'Subcategory': subcategory_col_final,
+            'Goal': 'Goal', 
+            'Pledged Amount': 'Pledged Amount',
+            '%Raised': '%Raised',
+            'Backer Count': 'Backer Count',
+            'Raw Goal': 'Raw Goal',
+            'Raw Pledged': 'Raw Pledged',
+            'Raw Raised': 'Raw Raised',
+            'Raw Date': 'Raw Date',
+            'Raw Deadline': 'Raw Deadline',
+            'Country Code': loc_country_col
+        }
+
+        select_cols = []
+        rename_map = {}
+        missing_original_codes = []
+        for final_name, source_col_ref in final_columns_mapping.items():
+             if source_col_ref and source_col_ref in df.columns:
+                 select_cols.append(source_col_ref)
+                 if final_name != source_col_ref:
+                      rename_map[source_col_ref] = final_name
+             else:
+                 print(f"Warning: Source column '{source_col_ref}' for final column '{final_name}' not found. Column will be missing.")
+                 missing_original_codes.append(final_name)
+
+        if not select_cols:
+             print("Error: No columns could be selected for the final DataFrame.")
+             return False
+
+        df_final = df[select_cols].copy() 
+        df_final.rename(columns=rename_map, inplace=True)
+
+        for missing_col in missing_original_codes:
+             if missing_col not in df_final.columns:
+                 print(f"Adding missing final column '{missing_col}' with default value 'N/A'.")
+                 df_final[missing_col] = "N/A" 
+
+        string_like_cols = ['Project Name', 'Creator', 'Link', 'State', 'Country', 'Category', 'Subcategory', 'Country Code', 'Date', 'Deadline']
+        for col in df_final.columns:
+             if col in string_like_cols:
+                 df_final[col] = df_final[col].astype(str).fillna("N/A")
+
+        print(f"Selected {len(df_final.columns)} final columns.")
 
         # --- Calculate Popularity Score on the final DataFrame ---
-        now_dt_expr = pl.lit(pd.Timestamp.now()).cast(pl.Datetime) # Keep as expression
-        if 'Raw Date' not in df_final.columns or df_final['Raw Date'].dtype != pl.Datetime:
-             print("Error: 'Raw Date' column missing/wrong type for popularity score. Setting time_factor to 0.")
-             df_final = df_final.with_columns(pl.lit(0.0).alias('time_factor'))
+        print("Calculating popularity score...")
+        if 'Raw Date' not in df_final.columns or not pd.api.types.is_datetime64_any_dtype(df_final['Raw Date']):
+             print("Error: 'Raw Date' column missing or wrong type for popularity score. Setting time_factor to 0.")
+             df_final['time_factor'] = 0.0
         else:
-             # Define expression for days difference
-             days_diff_expr = (now_dt_expr - pl.col('Raw Date')).dt.total_days()
+             now_dt = pd.Timestamp.now(tz='UTC')
+             time_delta_days = (now_dt - df_final['Raw Date']).dt.total_seconds() / (24 * 3600)
 
-             # Compute the maximum positive days difference *eagerly*
-             # Filter out rows where calculation might fail or be invalid before computing max
-             try:
-                 valid_days_diff = df_final.select(days_diff_expr.alias('diff')).filter(pl.col('diff').is_not_nan() & pl.col('diff').is_not_null() & (pl.col('diff') > 0))
-                 if not valid_days_diff.is_empty():
-                     computed_max_days = valid_days_diff.select(pl.max('diff')).item()
-                 else:
-                      computed_max_days = None
-             except Exception as e:
-                  print(f"Warning: Error computing max days difference: {e}. Setting time factor to 0.")
-                  computed_max_days = None
+             valid_days_diff = time_delta_days[time_delta_days > 0]
+             computed_max_days = valid_days_diff.max() if not valid_days_diff.empty else None
 
-
-             # Now use the computed scalar value in the Python if statement
              if computed_max_days is None or computed_max_days <= 0:
-                  print("Warning: Could not determine a valid positive max_days for time factor. Setting time_factor to 0.")
-                  time_factor_expr = pl.lit(0.0)
+                  print("Warning: Could not determine valid positive max_days for time factor. Setting time_factor to 0.")
+                  df_final['time_factor'] = 0.0
              else:
-                 # Use the computed_max_days scalar in the expression for normalization
-                 # This expression will be applied row-wise by with_columns
-                 time_factor_expr = (1.0 - (days_diff_expr / computed_max_days)).clip(0.0, 1.0) # Ensure it's between 0 and 1
+                 df_final['time_factor'] = (1.0 - (time_delta_days / computed_max_days)).clip(0.0, 1.0)
 
-             # Add the resulting time_factor column using the appropriate expression
-             df_final = df_final.with_columns(time_factor_expr.fill_null(0.0).alias('time_factor'))
-
+             df_final['time_factor'] = df_final['time_factor'].fillna(0.0).astype(float)
 
         required_norm_cols_final = ['Backer Count', 'Raw Pledged', 'Raw Raised']
         missing_norm_cols_final = [col for col in required_norm_cols_final if col not in df_final.columns]
         if missing_norm_cols_final:
-            print(f"Error: Missing columns for normalization in final DF: {missing_norm_cols_final}. Pop score inaccurate.")
-            df_final = df_final.with_columns(pl.lit(0.0).alias('Popularity Score')) # Add default score col
+            print(f"Error: Missing columns for normalization in final DF: {missing_norm_cols_final}. Popularity score will be inaccurate (set to 0).")
+            df_final['Popularity Score'] = 0.0
         else:
             # --- Popularity Score Calculations (using df_final) ---
-            # Capped Percentage Expression (can be defined once)
-            capped_percentage_expr = pl.col('Raw Raised').clip(upper_bound=500.0).fill_null(0.0).alias('capped_percentage')
+            df_final['capped_percentage'] = df_final['Raw Raised'].clip(upper=500.0).fillna(0.0)
 
-            # Function for normalization (safer inside the scope)
-            def normalize_col_final_safe(df_context, col_name):
-                 if col_name not in df_context.columns:
-                      print(f"Warning: Column '{col_name}' not found for normalization.")
-                      return pl.lit(0.0)
-
-                 # Eagerly compute min/max on the context DataFrame
-                 min_max_df = df_context.select(
-                     pl.min(col_name).alias('min_val'),
-                     pl.max(col_name).alias('max_val')
-                 )
-                 min_val = min_max_df.item(0, 'min_val')
-                 max_val = min_max_df.item(0, 'max_val')
-
-                 if min_val is None or max_val is None:
-                      print(f"Warning: Min/max for '{col_name}' could not be determined. Normalization returns 0.")
-                      return pl.lit(0.0)
+            def normalize_col_pd_safe(series):
+                 min_val = series.min()
+                 max_val = series.max()
+                 if pd.isna(min_val) or pd.isna(max_val):
+                     print(f"Warning: Min/max for normalization is None/NaN for {series.name}. Normalization returns 0.")
+                     return pd.Series(0.0, index=series.index) 
 
                  range_val = max_val - min_val
                  if range_val == 0:
-                      return pl.lit(0.0) # Avoid division by zero
+                      return pd.Series(0.0, index=series.index) 
                  else:
-                      # Return the expression for normalization
-                      return ((pl.col(col_name) - min_val) / range_val).fill_null(0.0)
+                      return ((series - min_val) / range_val).fillna(0.0).astype(float)
 
-            # Apply normalization expressions
-            df_final = df_final.with_columns([
-                 normalize_col_final_safe(df_final, 'Backer Count').alias('normalized_backers'),
-                 normalize_col_final_safe(df_final, 'Raw Pledged').alias('normalized_pledged'),
-                 capped_percentage_expr # Add the capped percentage column
-            ])
+            # Apply normalization
+            df_final['Backer Count'] = pd.to_numeric(df_final['Backer Count'], errors='coerce').fillna(0)
+            df_final['Raw Pledged'] = pd.to_numeric(df_final['Raw Pledged'], errors='coerce').fillna(0)
+            df_final['capped_percentage'] = pd.to_numeric(df_final['capped_percentage'], errors='coerce').fillna(0)
 
-            # Normalize the capped percentage separately
-            # Need to compute its min/max *after* it's added
-            normalized_percentage_expr = normalize_col_final_safe(df_final, 'capped_percentage')
-
+            df_final['normalized_backers'] = normalize_col_pd_safe(df_final['Backer Count'])
+            df_final['normalized_pledged'] = normalize_col_pd_safe(df_final['Raw Pledged'])
+            df_final['normalized_percentage'] = normalize_col_pd_safe(df_final['capped_percentage'])
 
             # Calculate Popularity Score
-            pop_score_components = ['normalized_backers', 'normalized_pledged', 'time_factor']
-            missing_pop_components = [c for c in pop_score_components if c not in df_final.columns]
+            if 'time_factor' not in df_final.columns: df_final['time_factor'] = 0.0
 
-            if missing_pop_components:
-                 print(f"Error: Missing pop score components in final DF: {missing_pop_components}. Setting score to 0.")
-                 df_final = df_final.with_columns(pl.lit(0.0).alias('Popularity Score'))
-            else:
-                 df_final = df_final.with_columns(
-                     (
-                          pl.col('normalized_backers') * 0.2778 +
-                          pl.col('normalized_pledged') * 0.3889 +
-                          normalized_percentage_expr * 0.2222 + # Use the normalized capped percentage expression
-                          pl.col('time_factor') * 0.1111
-                     ).alias('Popularity Score').cast(pl.Float64).fill_null(0.0)
-                 )
+            df_final['Popularity Score'] = (
+                 df_final['normalized_backers'] * 0.2778 +
+                 df_final['normalized_pledged'] * 0.3889 +
+                 df_final['normalized_percentage'] * 0.2222 +
+                 df_final['time_factor'] * 0.1111
+            ).astype(float).fillna(0.0)
 
-            # Clean up temporary normalization columns
-            cols_to_drop = ['normalized_backers', 'normalized_pledged', 'time_factor', 'capped_percentage']
+            cols_to_drop = ['normalized_backers', 'normalized_pledged', 'time_factor', 'capped_percentage', 'normalized_percentage']
             existing_cols_to_drop = [col for col in cols_to_drop if col in df_final.columns]
             if existing_cols_to_drop:
-                 df_final = df_final.drop(existing_cols_to_drop)
+                 df_final.drop(columns=existing_cols_to_drop, inplace=True)
 
 
-        print("Polars transformations complete.")
-        # --- End Polars Transformations ---
+        print("Popularity score calculation complete.")
 
-        # Write final Polars DataFrame to Parquet
-        # Ensure the DataFrame is not empty before writing
-        if df_final.height == 0:
-            print("Warning: Final DataFrame is empty. Skipping Parquet write.")
+        if df_final.empty:
+            print("Warning: Final DataFrame is empty after processing and filtering. Skipping Parquet write.")
             return False
 
-        df_final.write_parquet(parquet_file, compression='snappy', use_pyarrow=True)
+        print(f"\n--- Writing Final DataFrame ({len(df_final)} rows) ---")
+        print(f"Output path: {parquet_output_path}")
+        print("Final Schema:")
+        print(df_final.info()) 
+
+        Path(parquet_output_path).parent.mkdir(parents=True, exist_ok=True)
+        df_final.to_parquet(parquet_output_path, compression='snappy', engine='pyarrow', index=False) 
 
         elapsed_time = time.time() - start_time
-        file_size_mb = os.path.getsize(parquet_file) / (1024 * 1024)
-        print(f"Conversion completed in {elapsed_time:.2f} seconds")
-        print(f"Parquet file saved to {parquet_file} ({file_size_mb:.2f} MB)")
-
+        file_size_mb = os.path.getsize(parquet_output_path) / (1024 * 1024) if os.path.exists(parquet_output_path) else 0
+        print(f"\nProcessing and Parquet conversion completed in {elapsed_time:.2f} seconds")
+        print(f"Parquet file saved to {parquet_output_path} ({file_size_mb:.2f} MB)")
         print("Final columns saved:", ", ".join(list(df_final.columns)))
-        # print("Sample data head:\n", df_final.head(3)) # Limit output size
 
-        # --- Calculate and save filter metadata ---
-        filter_metadata_file = "filter_metadata.json"
-        save_filter_metadata(df_final, filter_metadata_file)
-        # We return True indicating parquet success, metadata saving is best-effort
+        save_filter_metadata(df_final, FILTER_METADATA_FILENAME)
+
         return True
 
     except Exception as e:
         import traceback
-        print(f"JSON to Parquet conversion failed: {e}")
-        print(traceback.format_exc()) # Print full traceback
+        print(f"\n--- ERROR during DataFrame processing ---")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {e}")
+        print("Traceback:")
+        print(traceback.format_exc())
+        if 'df' in locals() and isinstance(df, pd.DataFrame):
+             print("\nDataFrame sample at error point:")
+             try:
+                  print(df.head(3))
+             except Exception as e_print:
+                  print(f"(Could not print DataFrame head: {e_print})")
+        if 'df_final' in locals() and isinstance(df_final, pd.DataFrame):
+             print("\nFinal DataFrame sample at error point:")
+             try:
+                  print(df_final.head(3))
+             except Exception as e_print:
+                  print(f"(Could not print df_final head: {e_print})")
+
         return False
 
-def extract_base_name(file_path):
-    """
-    Extracts the base name from a file path without any extensions.
-    
-    Args:
-        file_path (str): Path to the file
-        
-    Returns:
-        str: Base name without extensions
-    """
-    # Extract just the filename without directory
-    file_name = os.path.basename(file_path)
-    
-    # Remove all extensions (.json.gz -> base_name)
-    base_name = file_name.split('.')[0]
-    
-    return base_name
-
-def process_kickstarter_data(url=None, output_filename=None,
-                             download=True, split=True, decompress=True,
-                             keep_chunks=True, chunk_size=CHUNK_SIZE,
-                             convert_to_parquet=True,
-                             halved=False):
-    """
-    Process Kickstarter data through download, splitting, decompression, and conversion to Parquet.
-    Also generates a metadata file for frontend filters.
-
-    Args:
-        url (str): URL or local path of the file
-        output_filename (str): Name of the file to save the decompressed JSON data
-        download (bool): Whether to download the file
-        split (bool): Whether to split the downloaded file into chunks
-        decompress (bool): Whether to decompress the file (from chunks or directly)
-        keep_chunks (bool): Whether to keep the downloaded chunks after processing
-        chunk_size (int): Size of chunks in bytes for download splitting
-        convert_to_parquet (bool): Whether to convert JSON to Parquet
-        halved (bool): If True, only process half of the entries
-
-    Returns:
-        dict: Dictionary with paths to the processed files (chunks, decompressed JSON, Parquet, filter metadata)
-    """
-    result = {
-        "chunks": [],
-        "decompressed": None,
-        "parquet": None,
-        "filter_metadata": None # Added key for metadata file
-    }
-
-    # Determine source URL
-    if url is None:
-        if LOCAL:
-            url = LOCAL_FILE
-        else:
-            url = get_kickstarter_download_link()
-            if not url:
-                print("Failed to get download link")
-                return result
-    
-    # Extract base name from URL/file for consistent naming
-    base_name = extract_base_name(url)
-    
-    # Set output filenames with proper extensions
-    if output_filename is None:
-        output_filename = f"{base_name}.json"
-    
-    # Make sure output_filename has .json extension
-    if not output_filename.lower().endswith('.json'):
-        output_filename = f"{os.path.splitext(output_filename)[0]}.json"
-    
-    # Define parquet filename based on the same base name
-    parquet_file = f"{base_name}.parquet"
-    
-    # STEP 1: Download
-    file_bytes = None
-    if download:
-        file_bytes = download_file(url)
-        if file_bytes is None:
-            return result
-    
-    # STEP 2: Split into chunks
-    chunk_dir = "gzip_chunks" if keep_chunks else "temp_chunks"
-    chunk_files = []
-    
-    if split and file_bytes is not None:
-        print(f"Breaking file into chunks of {chunk_size/(1024*1024):.2f} MB...")
-        chunk_files = split_into_chunks(file_bytes, chunk_size, dir_name=chunk_dir)
-        result["chunks"] = chunk_files
-    
-    # If we're not keeping chunks and not decompressing, we're done
-    if not decompress:
-        if not keep_chunks and os.path.exists("temp_chunks"):
-            shutil.rmtree("temp_chunks")
-        return result
-    
-    # STEP 3: Decompress
-    decompression_success = False
-    
-    # Try direct decompression first if we have a URL
-    if url and os.path.exists(url):
-        decompression_success = decompress_gzip(url, output_filename)
-    
-    # If direct decompression failed or we only have chunks, try reconstruction
-    if not decompression_success and chunk_files:
-        decompression_success = reconstruct_and_decompress(chunk_files, output_filename)
-    
-    # Clean up chunks if not keeping them
-    if not keep_chunks:
-        for chunk_file in chunk_files:
-            if os.path.exists(chunk_file):
-                os.remove(chunk_file)
-        if os.path.exists("temp_chunks") and not os.listdir("temp_chunks"):
-            shutil.rmtree("temp_chunks")
-    
-    if decompression_success:
-        result["decompressed"] = output_filename
-    else:
-        return result  # Stop if decompression failed
-    
-    # STEP 4: Convert to Parquet
-    filter_metadata_file = "filter_metadata.json" # Keep this name as specified
-    if convert_to_parquet and result["decompressed"]:
-        conversion_success = json_to_parquet(output_filename, parquet_file, halved)
-        if conversion_success:
-            result["parquet"] = parquet_file
-            # Check if metadata file was created
-            if os.path.exists(filter_metadata_file):
-                 result["filter_metadata"] = filter_metadata_file
-            else:
-                 print(f"Warning: Parquet conversion succeeded, but filter metadata file '{filter_metadata_file}' was not found.")
-        else:
-            # If conversion fails, keep the decompressed JSON if it exists
-            if not os.path.exists(output_filename):
-                 result["decompressed"] = None
-            return result # Stop if conversion failed
-
-    return result
-
 if __name__ == "__main__":
-    result = process_kickstarter_data(
-        output_filename=None,  # Let the function determine the filename based on input
-        keep_chunks=True,      # Keep downloaded gzip chunks
-        convert_to_parquet=True,
-        halved=HALVED          # Pass the HALVED flag
-    )
+    print("--- Starting Kickstarter Data Processing ---")
+    overall_start_time = time.time()
 
-    print("\nProcessing completed!")
-    if result["decompressed"]:
-        print(f"Intermediate decompressed JSON file: {result['decompressed']}")
-    if result["chunks"]:
-        print(f"Downloaded Gzip Chunks: {len(result['chunks'])} files in {os.path.dirname(result['chunks'][0])}")
-    if result["parquet"]:
-        print(f"Final Parquet file: {result['parquet']}")
-        if HALVED:
-            print("Note: Parquet file contains only half of the original entries.")
-    if result["filter_metadata"]:
-        print(f"Filter metadata file: {result['filter_metadata']}")
+    sorted_files, latest_date = find_kickstarter_files(KICKSTARTER_DATA_DIR)
+
+    if not sorted_files:
+        print("No files to process. Exiting.")
+        exit()
+
+    latest_file_path = sorted_files[0][0]
+    output_parquet_filename = f"{latest_file_path.stem.split('.')[0]}.parquet" 
+    output_dir = Path(output_parquet_filename).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    filter_metadata_path = output_dir / FILTER_METADATA_FILENAME 
+
+    all_records = []
+    seen_ids = set()
+    total_lines_processed = 0
+
+    print(f"\n--- Reading and Filtering Records ({len(sorted_files)} files) ---")
+    for file_path, file_date in sorted_files:
+        print(f"Processing file: {file_path.name} ({file_date})")
+        file_start_time = time.time()
+        lines_in_file = 0
+        records_added_from_file = 0
+        reminder_threshold = PROGRESS_REMINDER_INTERVAL
+
+        try:
+            with gzip.open(file_path, 'rt', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    lines_in_file += 1
+                    total_lines_processed += 1
+
+                    if lines_in_file >= reminder_threshold:
+                        print(f"  ... processed {lines_in_file:,} lines in {file_path.name}")
+                        reminder_threshold += PROGRESS_REMINDER_INTERVAL
+
+                    try:
+                        record = json.loads(line)
+                        if 'data' in record and isinstance(record['data'], dict) and 'id' in record['data']:
+                            project_id = record['data']['id']
+                            try:
+                                project_id_int = int(project_id)
+                            except (ValueError, TypeError):
+                                continue 
+
+                            if project_id_int not in seen_ids:
+                                seen_ids.add(project_id_int)
+
+                                data = record['data']
+                                if 'state' not in data or data['state'] is None:
+                                     data['state'] = "unknown"
+                                else:
+                                     data['state'] = str(data['state'])
+
+                                all_records.append(data)
+                                records_added_from_file += 1
+
+                    except json.JSONDecodeError:
+                        print(f"  Warning: Skipping invalid JSON line {lines_in_file} in {file_path.name}")
+                        continue
+                    except Exception as e_line:
+                        print(f"  Error processing line {lines_in_file} in {file_path.name}: {e_line}")
+                        continue 
+
+            file_elapsed = time.time() - file_start_time
+            print(f"  Finished {file_path.name}: Read {lines_in_file:,} lines, added {records_added_from_file:,} unique records. Took {file_elapsed:.2f}s.")
+
+        except FileNotFoundError:
+             print(f"Error: File not found: {file_path}. Skipping.")
+        except Exception as e_file:
+             print(f"Error reading or processing file {file_path.name}: {e_file}")
+
+
+    print(f"\n--- Initial Record Collection Complete ---")
+    print(f"Total lines processed across all files: {total_lines_processed:,}")
+    print(f"Total unique project records found: {len(all_records):,}")
+
+    if not all_records:
+        print("No records collected. Exiting.")
+        exit()
+
+    print("\n--- Creating Pandas DataFrame ---")
+    try:
+        df_combined = pd.DataFrame(all_records)
+        print(f"Initial DataFrame created with {len(df_combined)} rows and {len(df_combined.columns)} columns.")
+        del all_records
+        import gc
+        gc.collect()
+    except Exception as e_df:
+        print(f"Error creating DataFrame: {e_df}")
+        exit()
+
+    success = process_kickstarter_dataframe(df_combined, latest_date, output_parquet_filename)
+
+    overall_elapsed = time.time() - overall_start_time
+    print("\n--- Processing Summary ---")
+    if success:
+        print(f"Successfully processed data and saved to: {output_parquet_filename}")
+        if os.path.exists(filter_metadata_path):
+             print(f"Filter metadata saved to: {filter_metadata_path}")
+        else:
+             print(f"Warning: Filter metadata file '{filter_metadata_path}' was not generated.")
+        print(f"Total execution time: {overall_elapsed:.2f} seconds")
+
     else:
-        print("Filter metadata file was not generated.")
+        print("Processing failed. Please review the error messages above.")
+        print(f"Total execution time: {overall_elapsed:.2f} seconds")
