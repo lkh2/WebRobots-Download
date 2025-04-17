@@ -10,8 +10,6 @@ from pathlib import Path
 import country_converter as coco
 from pandas.errors import ParserError
 
-LOCAL_FILE = "C:/Users/leeka/Downloads/Kickstarter/Kickstarter_2025-03-12T07_34_02_656Z.json.gz"
-
 # Directory containing the Kickstarter JSON.gz files
 KICKSTARTER_DATA_DIR = Path("C:/Users/leeka/Downloads/Kickstarter")
 # Output filename for filter metadata
@@ -367,37 +365,6 @@ def process_kickstarter_dataframe(df: pd.DataFrame, latest_dataset_date: datetim
 
         df['Raw Date'] = pd.to_datetime(df['Raw Date'], utc=True)
         df['Raw Deadline'] = pd.to_datetime(df['Raw Deadline'], utc=True)
-
-
-        # --- Deadline/State Filter ---
-        if latest_dataset_date:
-            dataset_creation_dt_pd = pd.Timestamp(latest_dataset_date, tz='UTC') 
-
-            if state_col and state_col in df.columns and 'Raw Deadline' in df.columns and pd.api.types.is_datetime64_any_dtype(df['Raw Deadline']):
-                initial_rows = len(df)
-                print(f"Applying filter: Removing rows where Raw Deadline < {latest_dataset_date} AND original state is live/submitted/started...")
-
-                state_series = df[state_col].astype(str).fillna("").str.lower()
-
-                remove_condition = (
-                    (df['Raw Deadline'] < dataset_creation_dt_pd) &
-                    (state_series.isin(['live', 'submitted', 'started']))
-                )
-
-                df = df[~remove_condition].reset_index(drop=True)
-
-                removed_count = initial_rows - len(df)
-                print(f"Removed {removed_count} rows based on deadline/state filter.")
-            else:
-                missing_cols_warn = []
-                if not (state_col and state_col in df.columns):
-                    missing_cols_warn.append(f"'{state_col}' (original state)")
-                if 'Raw Deadline' not in df.columns or not pd.api.types.is_datetime64_any_dtype(df['Raw Deadline']):
-                     missing_cols_warn.append("'Raw Deadline' (Datetime)")
-                print(f"Warning: Skipping deadline/state filter due to missing/incorrect columns: {', '.join(missing_cols_warn)}.")
-        else:
-            print("Warning: Skipping deadline/state filter because latest dataset date was not provided.")
-
 
         # --- Backer Count ---
         if backers_col and backers_col in df.columns:
