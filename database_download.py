@@ -7,6 +7,8 @@ import shutil
 import pandas as pd
 import json
 import polars as pl 
+import re
+import datetime
 
 LOCAL = True
 LOCAL_FILE = "C:/Users/leeka/Downloads/Kickstarter/Kickstarter_2025-03-12T07_34_02_656Z.json.gz"
@@ -345,34 +347,55 @@ def save_filter_metadata(df_final: pl.DataFrame, output_json_path: str):
         print(f"Error calculating or saving filter metadata: {e}")
         print(traceback.format_exc())
 
+def extract_date_from_filename(filename):
+    """
+    Extracts the date (YYYY-MM-DD) from a filename matching the pattern
+    'Kickstarter_YYYY-MM-DDTHH_MM_SS_MSZ...'
+    """
+    match = re.search(r'Kickstarter_(\d{4}-\d{2}-\d{2})T', os.path.basename(filename))
+    if match:
+        date_str = match.group(1)
+        try:
+            # Return a pandas Timestamp which Polars can handle
+            return pd.to_datetime(date_str)
+        except ValueError:
+            print(f"Warning: Could not parse date '{date_str}' from filename '{filename}'.")
+            return None
+    else:
+        print(f"Warning: Could not find date pattern 'Kickstarter_YYYY-MM-DDTHH' in filename '{filename}'.")
+        return None
+
 def json_to_parquet(json_file, parquet_file, halved=False):
     """
     Convert a JSON file to Parquet format, performing calculations, cleaning,
-    and deduplicating based on project URL.
-    
+    deduplicating based on project URL, and applying specific filters.
+
     Args:
         json_file (str): Path to the JSON file
         parquet_file (str): Path to save the Parquet file
         halved (bool): If True, only process half of the entries
-        
+
     Returns:
         bool: True if successful, False otherwise
     """
     print(f"Converting {json_file} to Parquet format..." + (" (halved dataset)" if halved else ""))
     start_time = time.time()
-    
+
     try:
+        # --- Extract Dataset Creation Date ---
+        dataset_creation_datetime = extract_date_from_filename(json_file)
+
         # Read the JSON file line by line
         records = []
         line_count = 0
         total_lines = 0
-        
+
         if halved:
             with open(json_file, 'r', encoding='utf-8', errors='replace') as f:
                 total_lines = sum(1 for _ in f)
             target_lines = total_lines // 2
             print(f"Total JSON lines: {total_lines}, processing approximately {target_lines} lines")
-        
+
         with open(json_file, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
                 line_count += 1
@@ -385,16 +408,20 @@ def json_to_parquet(json_file, parquet_file, halved=False):
                         if 'run_id' in record:
                             record['data']['run_id'] = record['run_id']
                         # Basic type checking for numeric fields
-                        for key in ['goal', 'pledged', 'backers_count', 'converted_pledged_amount', 'state_changed_at', 'updated_at', 'run_id']:
+                        for key in ['goal', 'pledged', 'backers_count', 'converted_pledged_amount', 'state_changed_at', 'updated_at', 'run_id', 'created_at', 'deadline']: # Added date fields
                             if key in record['data'] and not isinstance(record['data'][key], (int, float)):
                                 try:
-                                    # Try casting to float first, then int if it fails or key is run_id
-                                    if key == 'run_id':
+                                    # Try casting to float first, then int if it fails or key is run_id/date
+                                    if key in ['run_id', 'created_at', 'deadline', 'state_changed_at', 'updated_at']:
                                          record['data'][key] = int(record['data'][key]) if record['data'][key] is not None else 0
                                     else:
                                          record['data'][key] = float(record['data'][key]) if record['data'][key] is not None else 0.0
                                 except (ValueError, TypeError):
-                                     record['data'][key] = 0 # Use 0 for Int or 0.0 for Float? Defaulting to 0 for simplicity
+                                     # Ensure 'state' gets a default if conversion fails, other numeric default to 0
+                                     if key == 'state':
+                                         record['data'][key] = "unknown" # Or another appropriate default
+                                     else:
+                                         record['data'][key] = 0
                         records.append(record['data'])
                 except json.JSONDecodeError:
                     print(f"Skipping invalid JSON line: {line_count}")
@@ -513,13 +540,13 @@ def json_to_parquet(json_file, parquet_file, halved=False):
         exchange_rate_col = safe_column_access(df, ['usd_exchange_rate', 'static_usd_rate'])
         pledged_col = safe_column_access(df, ['converted_pledged_amount', 'pledged'])
         created_col = safe_column_access(df, ['created_at'])
-        deadline_col = safe_column_access(df, ['deadline'])
+        deadline_col = safe_column_access(df, ['deadline']) # Keep original name for processing
         backers_col = safe_column_access(df, ['backers_count'])
         name_col = safe_column_access(df, ['name'])
         creator_col = safe_column_access(df, ['creator.name'])
         link_col = safe_column_access(df, ['urls.web.project']) # Use the flattened URL column
         country_expanded_col = safe_column_access(df, ['location.expanded_country'])
-        state_col = safe_column_access(df, ['state'])
+        state_col = safe_column_access(df, ['state']) # Keep original name for processing
         category_col = safe_column_access(df, ['category.parent_name'])
         subcategory_col = safe_column_access(df, ['category.name'])
         country_code_col = safe_column_access(df, ['location.country'])
@@ -611,6 +638,40 @@ def json_to_parquet(json_file, parquet_file, halved=False):
             print("Warning: 'deadline' column not found. Setting 'Raw Deadline' to default.")
             df = df.with_columns(default_date.alias('Raw Deadline'))
 
+        # --- Apply Deadline/State Filter ---
+        # Filter rows where Raw Deadline is before the dataset creation date
+        # AND the original 'state' (before aliasing/selection) is 'live', 'submitted', or 'started'.
+        if dataset_creation_datetime:
+            dataset_creation_date_pl = pl.lit(dataset_creation_datetime).cast(pl.Datetime)
+            # Check if required columns exist for filtering
+            if state_col and state_col in df.columns and 'Raw Deadline' in df.columns and df['Raw Deadline'].dtype == pl.Datetime:
+                initial_rows = df.height
+                print(f"Applying filter: Removing rows where Raw Deadline < {dataset_creation_datetime.date()} AND state is live/submitted/started...")
+
+                # Ensure 'state' column is treated as string for comparison
+                state_col_expr = pl.col(state_col).cast(pl.Utf8, strict=False).fill_null("").str.to_lowercase()
+
+                # Condition to identify rows TO REMOVE
+                remove_condition = (
+                    (pl.col('Raw Deadline') < dataset_creation_date_pl) &
+                    (state_col_expr.is_in(['live', 'submitted', 'started']))
+                )
+
+                # Filter to KEEP rows that DO NOT match the remove condition
+                df = df.filter(~remove_condition)
+
+                removed_count = initial_rows - df.height
+                print(f"Removed {removed_count} rows based on deadline/state filter.")
+            else:
+                missing_cols_warn = []
+                if not (state_col and state_col in df.columns):
+                    missing_cols_warn.append(f"'{state_col}' (original state)")
+                if 'Raw Deadline' not in df.columns or df['Raw Deadline'].dtype != pl.Datetime:
+                     missing_cols_warn.append("'Raw Deadline' (Datetime)")
+                print(f"Warning: Skipping deadline/state filter due to missing/incorrect columns: {', '.join(missing_cols_warn)}.")
+        else:
+            print("Warning: Skipping deadline/state filter because dataset creation date could not be determined from filename.")
+
 
         # Backer count
         if backers_col:
@@ -632,7 +693,7 @@ def json_to_parquet(json_file, parquet_file, halved=False):
         )
 
         # --- Select final columns ---
-        # Use the Polars DataFrame `df` which has been deduplicated
+        # Use the Polars DataFrame `df` which has been filtered and deduplicated
         select_expressions = []
         # Add calculated display columns
         calculated_display_cols = ['Pledged Amount', 'Date', 'Deadline', 'Goal', '%Raised']
@@ -702,7 +763,7 @@ def json_to_parquet(json_file, parquet_file, halved=False):
             'Creator': creator_col,
             'Link': link_col, # Use the flattened URL column name used for deduplication
             # 'Country': country_expanded_col, # Handled above
-            'State': state_col,
+            'State': state_col, # Use original state col name, will be selected/aliased
             # 'Category': category_col, # Handled above
             'Subcategory': subcategory_col,
             'Country Code': country_code_col,
@@ -732,10 +793,17 @@ def json_to_parquet(json_file, parquet_file, halved=False):
              days_diff_expr = (now_dt_expr - pl.col('Raw Date')).dt.total_days()
 
              # Compute the maximum positive days difference *eagerly*
-             # We need the actual scalar value for the if condition and the denominator
-             computed_max_days = df_final.select(
-                 days_diff_expr.filter(days_diff_expr > 0).max() # Calculate max within select
-             ).item() # Get the scalar value (float or None)
+             # Filter out rows where calculation might fail or be invalid before computing max
+             try:
+                 valid_days_diff = df_final.select(days_diff_expr.alias('diff')).filter(pl.col('diff').is_not_nan() & pl.col('diff').is_not_null() & (pl.col('diff') > 0))
+                 if not valid_days_diff.is_empty():
+                     computed_max_days = valid_days_diff.select(pl.max('diff')).item()
+                 else:
+                      computed_max_days = None
+             except Exception as e:
+                  print(f"Warning: Error computing max days difference: {e}. Setting time factor to 0.")
+                  computed_max_days = None
+
 
              # Now use the computed scalar value in the Python if statement
              if computed_max_days is None or computed_max_days <= 0:
@@ -756,34 +824,51 @@ def json_to_parquet(json_file, parquet_file, halved=False):
             print(f"Error: Missing columns for normalization in final DF: {missing_norm_cols_final}. Pop score inaccurate.")
             df_final = df_final.with_columns(pl.lit(0.0).alias('Popularity Score')) # Add default score col
         else:
-            capped_percentage_expr = df_final['Raw Raised'].clip(upper_bound=500.0)
+            # --- Popularity Score Calculations (using df_final) ---
+            # Capped Percentage Expression (can be defined once)
+            capped_percentage_expr = pl.col('Raw Raised').clip(upper_bound=500.0).fill_null(0.0).alias('capped_percentage')
 
-            def normalize_col_final(col_name): # Renamed to avoid potential scope issues
-                 if col_name not in df_final.columns: return pl.lit(0.0)
-                 min_val = df_final[col_name].min()
-                 max_val = df_final[col_name].max()
-                 if min_val is None or max_val is None: return pl.lit(0.0)
+            # Function for normalization (safer inside the scope)
+            def normalize_col_final_safe(df_context, col_name):
+                 if col_name not in df_context.columns:
+                      print(f"Warning: Column '{col_name}' not found for normalization.")
+                      return pl.lit(0.0)
+
+                 # Eagerly compute min/max on the context DataFrame
+                 min_max_df = df_context.select(
+                     pl.min(col_name).alias('min_val'),
+                     pl.max(col_name).alias('max_val')
+                 )
+                 min_val = min_max_df.item(0, 'min_val')
+                 max_val = min_max_df.item(0, 'max_val')
+
+                 if min_val is None or max_val is None:
+                      print(f"Warning: Min/max for '{col_name}' could not be determined. Normalization returns 0.")
+                      return pl.lit(0.0)
+
                  range_val = max_val - min_val
-                 return pl.when(range_val == 0).then(0.0) \
-                          .otherwise((pl.col(col_name) - min_val) / range_val).fill_null(0.0)
+                 if range_val == 0:
+                      return pl.lit(0.0) # Avoid division by zero
+                 else:
+                      # Return the expression for normalization
+                      return ((pl.col(col_name) - min_val) / range_val).fill_null(0.0)
 
+            # Apply normalization expressions
             df_final = df_final.with_columns([
-                 normalize_col_final('Backer Count').alias('normalized_backers'),
-                 normalize_col_final('Raw Pledged').alias('normalized_pledged'),
-                 capped_percentage_expr.alias('capped_percentage')
+                 normalize_col_final_safe(df_final, 'Backer Count').alias('normalized_backers'),
+                 normalize_col_final_safe(df_final, 'Raw Pledged').alias('normalized_pledged'),
+                 capped_percentage_expr # Add the capped percentage column
             ])
 
-            min_capped = df_final['capped_percentage'].min()
-            max_capped = df_final['capped_percentage'].max()
-            if min_capped is not None and max_capped is not None:
-                range_capped = max_capped - min_capped
-                normalized_percentage_expr = pl.when(range_capped == 0).then(0.0) \
-                                             .otherwise((pl.col('capped_percentage') - min_capped) / range_capped).fill_null(0.0)
-            else:
-                normalized_percentage_expr = pl.lit(0.0)
+            # Normalize the capped percentage separately
+            # Need to compute its min/max *after* it's added
+            normalized_percentage_expr = normalize_col_final_safe(df_final, 'capped_percentage')
 
+
+            # Calculate Popularity Score
             pop_score_components = ['normalized_backers', 'normalized_pledged', 'time_factor']
             missing_pop_components = [c for c in pop_score_components if c not in df_final.columns]
+
             if missing_pop_components:
                  print(f"Error: Missing pop score components in final DF: {missing_pop_components}. Setting score to 0.")
                  df_final = df_final.with_columns(pl.lit(0.0).alias('Popularity Score'))
@@ -792,15 +877,17 @@ def json_to_parquet(json_file, parquet_file, halved=False):
                      (
                           pl.col('normalized_backers') * 0.2778 +
                           pl.col('normalized_pledged') * 0.3889 +
-                          normalized_percentage_expr * 0.2222 +
+                          normalized_percentage_expr * 0.2222 + # Use the normalized capped percentage expression
                           pl.col('time_factor') * 0.1111
                      ).alias('Popularity Score').cast(pl.Float64).fill_null(0.0)
                  )
 
+            # Clean up temporary normalization columns
             cols_to_drop = ['normalized_backers', 'normalized_pledged', 'time_factor', 'capped_percentage']
             existing_cols_to_drop = [col for col in cols_to_drop if col in df_final.columns]
             if existing_cols_to_drop:
                  df_final = df_final.drop(existing_cols_to_drop)
+
 
         print("Polars transformations complete.")
         # --- End Polars Transformations ---
@@ -819,7 +906,7 @@ def json_to_parquet(json_file, parquet_file, halved=False):
         print(f"Parquet file saved to {parquet_file} ({file_size_mb:.2f} MB)")
 
         print("Final columns saved:", ", ".join(list(df_final.columns)))
-        print("Sample data head:\n", df_final.head(3))
+        # print("Sample data head:\n", df_final.head(3)) # Limit output size
 
         # --- Calculate and save filter metadata ---
         filter_metadata_file = "filter_metadata.json"
