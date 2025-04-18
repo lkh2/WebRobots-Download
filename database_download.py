@@ -232,24 +232,6 @@ def process_kickstarter_dataframe(df: pd.DataFrame, latest_dataset_date: datetim
             df['urls.web.project'] = None
             web_project_url_col = 'urls.web.project'
 
-        # --- Deduplication Step (Based on URL) ---
-        deduplication_key_col = web_project_url_col 
-
-        if deduplication_key_col not in df.columns:
-             print(f"Error: Deduplication key column '{deduplication_key_col}' not found. Skipping deduplication.")
-        else:
-            print(f"Cleaning deduplication key column: '{deduplication_key_col}'")
-            original_rows = len(df)
-            df[deduplication_key_col] = df[deduplication_key_col].fillna("__MISSING_OR_EMPTY_URL__")
-            df[deduplication_key_col] = df[deduplication_key_col].replace("", "__MISSING_OR_EMPTY_URL__")
-            df[deduplication_key_col] = df[deduplication_key_col].astype(str) 
-            print(f"Finished cleaning '{deduplication_key_col}'. Null/empty strings replaced.")
-
-            print(f"Applying unique constraint on '{deduplication_key_col}', keeping first encountered record...")
-            df = df.drop_duplicates(subset=[deduplication_key_col], keep='first', ignore_index=True) 
-            removed_rows = original_rows - len(df)
-            print(f"Removed {removed_rows} duplicate rows based on project URL ('{deduplication_key_col}'). Kept first encountered instance.")
-
         # --- Flatten remaining structures needed ---
         flatten_cols = {
             'category': ['name', 'parent_name'],
