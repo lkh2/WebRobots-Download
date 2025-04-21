@@ -1,6 +1,6 @@
 # Kickstarter Data Preprocessing for CrowdInsight
 
-This script (`database_download.py`) preprocesses raw Kickstarter project data downloaded as gzipped JSON line files (`.json.gz`) for use with the CrowdInsight Streamlit application. It processes multiple data dumps, deduplicates projects, cleans and transforms the data, calculates derived metrics like popularity, and outputs a consolidated Parquet file and a JSON metadata file suitable for the application's filters.
+This script (`database_download.py`) preprocesses raw Kickstarter project data downloaded as gzipped JSON line files (`.json.gz`) for use with the [CrowdInsight Streamlit application](https://github.com/lkh2/CrowdInsight). It processes multiple data dumps, deduplicates projects, cleans and transforms the data, calculates derived metrics like popularity, and outputs a consolidated Parquet file and a JSON metadata file suitable for the application's filters.
 
 ## Input
 
