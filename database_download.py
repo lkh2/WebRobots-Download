@@ -11,7 +11,8 @@ import country_converter as coco
 from pandas.errors import ParserError
 
 # Directory containing the Kickstarter JSON.gz files
-KICKSTARTER_DATA_DIR = Path("C:/Users/leeka/Downloads/Kickstarter")
+# !!! IMPORTANT: Set this path to your data directory !!!
+KICKSTARTER_DATA_DIR = Path("")
 # Output filename for filter metadata
 FILTER_METADATA_FILENAME = "filter_metadata.json"
 # Progress reminder frequency
